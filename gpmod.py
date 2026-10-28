@@ -817,7 +817,7 @@ def build_forum_info_embed(
         inline=True,
     )
     embed.add_field(
-        name="🎴 Pack Slot",
+        name="🎴 Rarity",
         value=f"> `{pack_label}`",
         inline=True,
     )
