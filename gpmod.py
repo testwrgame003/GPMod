@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import numpy as np
 import discord
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
 # =========================================================
 # VARIABLES DE ENTORNO DESDE RAILWAY
@@ -29,23 +29,26 @@ UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/"
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
 # =========================================================
-# CONFIGURACIÓN GENERAL Y DIMENSIONES LINEALES
+# CONFIGURACIÓN GENERAL Y CACHÉ DE CARTAS
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
+CARDS_CACHE_DIR = OUTPUT_DIR / "cards_cache"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CARDS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("gp_linear_bot")
+logger = logging.getLogger("gp_fan_bot")
 
-LINEAR_HEIGHT = 540
-LINEAR_WIDTH_4_CARDS = 1534
-LINEAR_WIDTH_5_CARDS = 1914
-LINEAR_BG_COLOR = (16, 17, 36)  # #101124
+# Dimensiones optimizadas para que Discord muestre el Abanico grande y nítido
+FAN_CANVAS_W = 1480
+FAN_CANVAS_H = 780
+BG_DARK_COLOR = (13, 15, 32)       # Azul noche profundo
+BG_GLOW_COLOR = (34, 42, 88)       # Resplandor central sutil
 
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
@@ -58,7 +61,7 @@ INVALID_LOG_COOLDOWN = 10
 INVALID_LOG_LAST_SENT = {}
 
 CHANNEL_GROUP_MAP = {
-    1564890852310913034: "Elite_Four",
+    1497179630027800728: "Elite_Four",
     1497179450960379915: "Trainer",
     1534456693126332568: "Gym_Leader",
 }
@@ -66,30 +69,22 @@ CHANNEL_GROUP_MAP = {
 GROUP_CONFIG = {
     "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
     "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
-    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1497179653276827720},
 }
 
 group_locks = defaultdict(asyncio.Lock)
 http_session: Optional[aiohttp.ClientSession] = None
 
 # =========================================================
-# MOTOR DE CONVERSIÓN A FORMATO LINEAL (4 Y 5 CARTAS)
+# DETECCIÓN Y EXTRACCIÓN EXACTA DE CARTAS (4 Y 5 CARTAS)
 # =========================================================
 
 def is_already_linear_gp(img: Image.Image) -> bool:
     w, h = img.size
-    if h == 0:
-        return False
-    return (w / h) >= 2.1
-
-
+    return (w / max(h, 1)) >= 2.1
 
 
 def find_segments_1d(proj: np.ndarray, threshold: float = 0.12, min_len: int = 40) -> List[Tuple[int, int]]:
-    """
-    Encuentra los intervalos exactos (inicio, fin) donde hay cartas a partir de un perfil 1D,
-    ignorando el fondo oscuro sin cortar jamás el interior de una carta.
-    """
     active = proj > threshold
     padded = np.concatenate(([False], active, [False]))
     starts = np.where(padded[1:] & ~padded[:-1])[0]
@@ -98,10 +93,6 @@ def find_segments_1d(proj: np.ndarray, threshold: float = 0.12, min_len: int = 4
 
 
 def extract_axis_bounds(mask_slice: np.ndarray, axis: int, expected_count: int, fallback_rel: List[Tuple[float, float]]) -> List[Tuple[int, int]]:
-    """
-    Obtiene los bordes exactos de cada carta en una fila o columna.
-    Si por algún motivo no coincide el conteo, usa las coordenadas exactas medidas al píxel.
-    """
     length = mask_slice.shape[1 - axis]
     proj = mask_slice.mean(axis=axis)
 
@@ -115,116 +106,242 @@ def extract_axis_bounds(mask_slice: np.ndarray, axis: int, expected_count: int, 
 
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
     """
-    Detecta con precisión de píxel las 4 o 5 cartas separando primero las filas por el canal
-    oscuro central para que nunca se mezclen píxeles de arriba con los de abajo.
+    Extrae las 4 o 5 cartas tanto si vienen en formato cuadrícula normal (3+1 / 3+2)
+    como si vienen en formato lineal horizontal.
     """
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
     arr = np.array(rgb_img, dtype=np.float32)
 
-    # 1. Muestrear el color exacto del fondo oscuro en las esquinas inferiores vacías
+    # Si la imagen de entrada ya es lineal, dividirla en 4 o 5 partes iguales
+    if is_already_linear_gp(rgb_img):
+        num_c = 4 if (w / max(h, 1)) < 3.15 else 5
+        step = w / num_c
+        return [rgb_img.crop((int(i * step), 0, int((i + 1) * step), h)) for i in range(num_c)]
+
     corner_samples = np.concatenate([
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.01):int(w * 0.10)].reshape(-1, 3),
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.90):int(w * 0.99)].reshape(-1, 3),
     ], axis=0)
     bg_rgb = np.median(corner_samples, axis=0)
 
-    # 2. Mapa binario: True donde hay carta, False donde es fondo oscuro
     diff = np.linalg.norm(arr - bg_rgb, axis=2)
     mask = diff > 22.0
 
-    # 3. Encontrar la línea divisoria horizontal exacta entre la fila de arriba y la de abajo
-    mid_top = int(h * 0.46)
-    mid_bot = int(h * 0.54)
+    mid_top, mid_bot = int(h * 0.46), int(h * 0.54)
     row_profile = mask[mid_top:mid_bot, :].mean(axis=1)
     split_y = mid_top + int(np.argmin(row_profile))
 
-    # 4. Encontrar límites verticales exactos (Y) de la fila superior y de la fila inferior
     top_y_segs = find_segments_1d(mask[:split_y, :].mean(axis=1), threshold=0.10, min_len=int(h * 0.25))
     top_y1, top_y2 = top_y_segs[0] if top_y_segs else (int(round(0.043 * h)), int(round(0.493 * h)))
 
     bot_y_segs = find_segments_1d(mask[split_y:, :].mean(axis=1), threshold=0.10, min_len=int(h * 0.25))
     if bot_y_segs:
-        bot_y1 = split_y + bot_y_segs[0][0]
-        bot_y2 = split_y + bot_y_segs[0][1]
+        bot_y1, bot_y2 = split_y + bot_y_segs[0][0], split_y + bot_y_segs[0][1]
     else:
         bot_y1, bot_y2 = int(round(0.504 * h)), int(round(0.954 * h))
 
-    # 5. Encontrar límites horizontales exactos (X) de las 3 cartas de arriba
-    fallback_top_x = [
-        (0.0078, 0.3310),
-        (0.3388, 0.6612),
-        (0.6690, 0.9922),
-    ]
+    fallback_top_x = [(0.0078, 0.3310), (0.3388, 0.6612), (0.6690, 0.9922)]
     top_x_bounds = extract_axis_bounds(mask[top_y1:top_y2, :], axis=0, expected_count=3, fallback_rel=fallback_top_x)
 
-    # 6. Detectar si abajo hay 1 carta (Deluxe 4 cartas) o 2 cartas (Estándar 5 cartas)
     left_outer_check = mask[bot_y1:bot_y2, int(w * 0.18):int(w * 0.30)].mean()
     right_outer_check = mask[bot_y1:bot_y2, int(w * 0.70):int(w * 0.82)].mean()
     is_five_cards = (left_outer_check > 0.25 and right_outer_check > 0.25)
 
     if is_five_cards:
-        fallback_bot_x = [
-            (0.1728, 0.4961),
-            (0.5039, 0.8272),
-        ]
+        fallback_bot_x = [(0.1728, 0.4961), (0.5039, 0.8272)]
         bot_x_bounds = extract_axis_bounds(mask[bot_y1:bot_y2, :], axis=0, expected_count=2, fallback_rel=fallback_bot_x)
     else:
-        fallback_bot_x = [
-            (0.3388, 0.6612),
-        ]
+        fallback_bot_x = [(0.3388, 0.6612)]
         bot_x_bounds = extract_axis_bounds(mask[bot_y1:bot_y2, :], axis=0, expected_count=1, fallback_rel=fallback_bot_x)
 
-    # 7. Recortar cada carta limpia y completa
     cards: List[Image.Image] = []
     for x1, x2 in top_x_bounds:
         cards.append(rgb_img.crop((x1, top_y1, x2, top_y2)))
-
     for x1, x2 in bot_x_bounds:
         cards.append(rgb_img.crop((x1, bot_y1, x2, bot_y2)))
 
     return cards
 
 
-def convert_gp_to_linear_bytes(source_img: Image.Image) -> Tuple[bytes, int, bool]:
-    if is_already_linear_gp(source_img):
-        buf = io.BytesIO()
-        source_img.save(buf, format="PNG")
-        w, h = source_img.size
-        approx_cards = 4 if (w / max(h, 1)) < 3.15 else 5
-        return buf.getvalue(), approx_cards, True
+# =========================================================
+# MOTOR GRÁFICO: MODO ABANICO + INSPECTOR INTERACTIVO (ZOOM)
+# =========================================================
 
-    cards = detect_and_extract_cards(source_img)
+def create_studio_background(width: int, height: int) -> Image.Image:
+    """Crea un fondo oscuro elegante con iluminación radial sutil en el centro."""
+    bg = Image.new("RGBA", (width, height), (*BG_DARK_COLOR, 255))
+    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(glow)
+
+    cx, cy = width // 2, height // 2
+    max_rx, max_ry = int(width * 0.48), int(height * 0.48)
+    for step in range(6, 0, -1):
+        ratio = step / 6.0
+        rx, ry = int(max_rx * ratio), int(max_ry * ratio)
+        alpha = int(38 * (1.0 - ratio + 0.15))
+        draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(*BG_GLOW_COLOR, alpha))
+
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=45))
+    return Image.alpha_composite(bg, glow)
+
+
+def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target_h: int, radius: int = 18) -> Image.Image:
+    """Redimensiona la carta con filtro LANCZOS, realza su nitidez y redondea sus esquinas."""
+    resized = card_img.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+    sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGBA")
+
+    mask = Image.new("L", (target_w, target_h), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((0, 0, target_w - 1, target_h - 1), radius=radius, fill=255)
+
+    out = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    out.paste(sharpened, (0, 0), mask)
+    return out
+
+
+def paste_rotated_card_with_shadow(
+    canvas: Image.Image,
+    styled_card: Image.Image,
+    angle: float,
+    center_xy: Tuple[int, int],
+    shadow_offset: Tuple[int, int] = (-12, 16),
+    shadow_blur: int = 16,
+    shadow_opacity: int = 175
+) -> None:
+    """Rota una carta con interpolación BICUBIC y proyecta una sombra paralela 3D."""
+    pad = 45
+    w, h = styled_card.size
+    padded_card = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    padded_card.paste(styled_card, (pad, pad))
+
+    # Crear silueta negra para la sombra a partir del canal alfa
+    alpha = padded_card.split()[3]
+    shadow_alpha = alpha.point(lambda p: int(p * (shadow_opacity / 255.0)))
+    shadow_img = Image.new("RGBA", padded_card.size, (0, 0, 0, 0))
+    shadow_img.putalpha(shadow_alpha)
+
+    rot_card = padded_card.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+    rot_shadow = shadow_img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+    rot_shadow = rot_shadow.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
+
+    rw, rh = rot_card.size
+    cx, cy = center_xy
+    top_left_x = cx - (rw // 2)
+    top_left_y = cy - (rh // 2)
+
+    canvas.alpha_composite(rot_shadow, (top_left_x + shadow_offset[0], top_left_y + shadow_offset[1]))
+    canvas.alpha_composite(rot_card, (top_left_x, top_left_y))
+
+
+def build_fan_image(cards: List[Image.Image]) -> Image.Image:
+    """
+    Construye el abanico de 4 o 5 cartas con superposición orgánica, arco curvo y sombras 3D.
+    """
     num_cards = len(cards)
+    canvas = create_studio_background(FAN_CANVAS_W, FAN_CANVAS_H)
 
-    canvas_w = LINEAR_WIDTH_4_CARDS if num_cards == 4 else LINEAR_WIDTH_5_CARDS
-    canvas_h = LINEAR_HEIGHT
-
-    margin_x = 15
-    margin_y = 15
-    gap_x = 14
-
-    target_card_h = canvas_h - (2 * margin_y)
-    total_gaps = gap_x * (num_cards - 1)
-    target_card_w = (canvas_w - (2 * margin_x) - total_gaps) / num_cards
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), LINEAR_BG_COLOR)
+    if num_cards == 4:
+        card_w, card_h = 435, 608
+        angles = [12.0, 4.0, -4.0, -12.0]
+        x_centers = [325, 595, 885, 1155]
+        y_offsets = [38, 0, 0, 38]
+        base_y = 385
+    else:
+        card_w, card_h = 415, 580
+        angles = [15.0, 7.5, 0.0, -7.5, -15.0]
+        x_centers = [265, 502, 740, 978, 1215]
+        y_offsets = [54, 14, 0, 14, 54]
+        base_y = 378
 
     for idx, card in enumerate(cards):
-        x_pos = int(round(margin_x + idx * (target_card_w + gap_x)))
-        x_next = int(round(margin_x + (idx + 1) * target_card_w + idx * gap_x))
-        exact_w = x_next - x_pos
+        styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
+        angle = angles[idx] if idx < len(angles) else 0.0
+        cx = x_centers[idx] if idx < len(x_centers) else (FAN_CANVAS_W // 2)
+        cy = base_y + (y_offsets[idx] if idx < len(y_offsets) else 0)
+        paste_rotated_card_with_shadow(canvas, styled, angle, (cx, cy))
 
-        resized_card = card.resize((exact_w, target_card_h), Image.Resampling.LANCZOS)
-        canvas.paste(resized_card, (x_pos, margin_y))
+    return canvas.convert("RGB")
+
+
+def build_inspected_card_image(cards: List[Image.Image], selected_index: int) -> bytes:
+    """
+    Recrea el efecto del juego cuando mantienes presionada una carta:
+    El abanico completo queda de fondo oscurecido y desenfocado, y la carta seleccionada
+    se muestra en el centro a tamaño gigante, recta y con resplandor alrededor.
+    """
+    fan_base = build_fan_image(cards).convert("RGBA")
+    # Oscurecer y desenfocar el fondo
+    darkened = ImageEnhance.Brightness(fan_base).enhance(0.32)
+    blurred_bg = darkened.filter(ImageFilter.GaussianBlur(radius=10))
+
+    # Escalar la carta seleccionada a tamaño gigante en el centro
+    target_h = 710
+    target_w = int(round(target_h * (365.5 / 510.0)))  # ~509 px
+    selected_card = cards[selected_index]
+    styled_giant = style_card_with_rounded_corners(selected_card, target_w, target_h, radius=22)
+
+    # Añadir resplandor dorado/blanco detrás de la carta gigante
+    cx, cy = FAN_CANVAS_W // 2, FAN_CANVAS_H // 2
+    glow_layer = Image.new("RGBA", (FAN_CANVAS_W, FAN_CANVAS_H), (0, 0, 0, 0))
+    g_draw = ImageDraw.Draw(glow_layer)
+    gx1, gy1 = cx - target_w // 2 - 12, cy - target_h // 2 - 12
+    gx2, gy2 = cx + target_w // 2 + 12, cy + target_h // 2 + 12
+    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(255, 225, 130, 120))
+    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
+
+    blurred_bg = Image.alpha_composite(blurred_bg, glow_layer)
+    paste_rotated_card_with_shadow(
+        blurred_bg,
+        styled_giant,
+        angle=0.0,
+        center_xy=(cx, cy),
+        shadow_offset=(0, 20),
+        shadow_blur=24,
+        shadow_opacity=220
+    )
 
     out_buf = io.BytesIO()
-    canvas.save(out_buf, format="PNG", optimize=True)
-    return out_buf.getvalue(), num_cards, False
+    blurred_bg.convert("RGB").save(out_buf, format="PNG", optimize=True)
+    return out_buf.getvalue()
+
+
+def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
+    """Guarda las cartas individuales en disco por 72h para que los botones de zoom respondan al instante."""
+    folder = CARDS_CACHE_DIR / str(cache_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    for i, c in enumerate(cards):
+        c.save(folder / f"card_{i}.png", format="PNG")
+
+    # Limpiar cachés viejos (>72h)
+    now = time.time()
+    for sub in CARDS_CACHE_DIR.iterdir():
+        if sub.is_dir() and (now - sub.stat().st_mtime) > (72 * 3600):
+            for f in sub.glob("*"):
+                f.unlink(missing_ok=True)
+            sub.rmdir()
+
+
+def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
+    folder = CARDS_CACHE_DIR / str(cache_id)
+    if not folder.exists():
+        return None
+    files = sorted(folder.glob("card_*.png"))
+    if not files:
+        return None
+    return [Image.open(f).convert("RGB") for f in files]
+
+
+def convert_gp_to_fan_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
+    cards = detect_and_extract_cards(source_img)
+    fan_img = build_fan_image(cards)
+    out_buf = io.BytesIO()
+    fan_img.save(out_buf, format="PNG", optimize=True)
+    return out_buf.getvalue(), cards
 
 
 # =========================================================
-# HELPERS UPSTASH REDIS (SESIÓN PERSISTENTE)
+# HELPERS UPSTASH REDIS
 # =========================================================
 
 async def get_http_session() -> aiohttp.ClientSession:
@@ -307,7 +424,6 @@ async def redis_hgetall_json(key: str) -> dict:
     result = await redis_command("hgetall", key)
     if not result:
         return {}
-
     items = result.items() if isinstance(result, dict) else zip(result[0::2], result[1::2])
     return {str(field): safe_json_loads(val, {}) for field, val in items}
 
@@ -335,38 +451,16 @@ async def redis_sadd_id(key: str, value: str) -> bool:
 # PARSERS DE METADATOS Y PROPIETARIO DEL GP
 # =========================================================
 
-def get_group_from_channel(channel_id: int) -> Optional[str]:
-    return CHANNEL_GROUP_MAP.get(channel_id)
-
-
-def is_target_message(message: discord.Message) -> bool:
-    if message.webhook_id is None:
-        return False
-    if message.channel.id not in CHANNEL_GROUP_MAP:
-        return False
-
-    content = message.content or ""
-    if any(pattern.search(content) for pattern in TRIGGER_PATTERNS):
-        return True
-    if len(message.attachments) > 0:
-        return True
-    return False
-
-
 def extract_owner_discord_id_from_first_line(content: str) -> Optional[str]:
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     if not lines:
         return None
     first = lines[0]
-
     m = re.search(r"<@?!?(\d{17,20})>", first)
     if m:
         return m.group(1)
-
     m = re.match(r"^@?(\d{17,20})\b", first)
-    if m:
-        return m.group(1)
-    return None
+    return m.group(1) if m else None
 
 
 def extract_first_line_username_hint(content: str) -> Optional[str]:
@@ -470,41 +564,28 @@ def names_match(input_name: str, user_data: dict) -> bool:
 async def resolve_rival_owner_by_game_id(game_id: str) -> Optional[dict]:
     if not game_id:
         return None
-
     try:
         rivals_sessions = await redis_hgetall_json("rivals_sessions")
-        for sess_id, sess in rivals_sessions.items():
-            members = (sess or {}).get("members") or []
-            for m in members:
+        for sess in rivals_sessions.values():
+            for m in (sess or {}).get("members") or []:
                 if str(m.get("gameId") or "").strip() == game_id:
                     uid = str(m.get("discordId"))
                     name = m.get("name") or m.get("heartbeatName") or uid
-                    return {
-                        "discord_id": uid,
-                        "display_name": name,
-                        "mention": f"<@{uid}>",
-                        "game_id": game_id,
-                    }
+                    return {"discord_id": uid, "display_name": name, "mention": f"<@{uid}>", "game_id": game_id}
     except Exception:
         pass
 
     try:
         rival_duos = await redis_hgetall_json("rival_duos")
-        for duo_id, duo in rival_duos.items():
+        for duo in rival_duos.values():
             online_users = (duo or {}).get("onlineUsers") or {}
             members = (duo or {}).get("members") or {}
             for uid, m_data in members.items():
                 if str(m_data.get("gameId") or "").strip() == game_id and online_users.get(str(uid), False):
                     name = m_data.get("name") or m_data.get("heartbeatName") or uid
-                    return {
-                        "discord_id": str(uid),
-                        "display_name": name,
-                        "mention": f"<@{uid}>",
-                        "game_id": game_id,
-                    }
+                    return {"discord_id": str(uid), "display_name": name, "mention": f"<@{uid}>", "game_id": game_id}
     except Exception:
         pass
-
     return None
 
 
@@ -575,11 +656,9 @@ async def cleanup_expired_vips(group: str):
         vip_data = await redis_command("hgetall", ts_key)
         if not vip_data:
             return
-
         now_ts = int(datetime.now(timezone.utc).timestamp())
         expire_seconds = 48 * 60 * 60
         items = vip_data.items() if isinstance(vip_data, dict) else zip(vip_data[0::2], vip_data[1::2])
-
         for friend_id, saved_ts in items:
             try:
                 if (now_ts - int(saved_ts)) >= expire_seconds:
@@ -609,7 +688,6 @@ async def get_online_mentions(group: str) -> List[str]:
         online_ids = await redis_smembers_ids(online_key(group))
         users = await load_group_users(group)
         mentions = []
-
         for discord_id, user_info in users.items():
             main_id = str(user_info.get("main_id", "")).strip()
             sec_id = str(user_info.get("sec_id", "")).strip()
@@ -656,7 +734,7 @@ async def increment_gp_callback(stats: dict) -> dict:
 
 
 # =========================================================
-# DISEÑO VISUAL DEL POST DEL FORO (EMBED MEJORADO)
+# DISEÑO VISUAL DEL POST DEL FORO + BOTONES DE ZOOM E HILO
 # =========================================================
 
 def build_post_title(meta: dict, pack_label: str) -> str:
@@ -701,9 +779,13 @@ def build_forum_info_embed(
     if alive_users or dead_users:
         alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "None"
         dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "None"
-        embed.add_field(name="🗳️ Community Votes", value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}", inline=False)
+        embed.add_field(
+            name="🗳️ Community Votes",
+            value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}",
+            inline=False,
+        )
 
-    embed.set_footer(text=f"File: {filename}")
+    embed.set_footer(text=f"💡 Tip: Click 🔍 1-5 below to inspect any card in full HD | File: {filename}")
     return embed
 
 
@@ -712,7 +794,7 @@ async def create_forum_post_with_image_bytes(
     group: str,
     title: str,
     image_bytes: bytes,
-    filename: str = "gp_linear.png",
+    filename: str = "gp_fan.png",
 ) -> Optional[dict]:
     try:
         forum_id = GROUP_CONFIG[group]["FORUM_CHANNEL_ID"]
@@ -728,8 +810,50 @@ async def create_forum_post_with_image_bytes(
         return None
 
 
+class CardZoomButton(discord.ui.Button):
+    """Botón interactivo para hacer zoom sobre una carta específica del abanico como en el juego."""
+    def __init__(self, cache_id: str, card_index: int):
+        super().__init__(
+            label=f"{card_index + 1}",
+            emoji="🔍",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"zoom:{cache_id}:{card_index}",
+            row=1,
+        )
+        self.cache_id = cache_id
+        self.card_index = card_index
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        cards = load_cards_from_cache(self.cache_id)
+        if not cards or self.card_index >= len(cards):
+            return await interaction.followup.send(
+                "❌ Card inspection cache expired for this pack.",
+                ephemeral=True,
+            )
+
+        zoomed_bytes = await asyncio.to_thread(build_inspected_card_image, cards, self.card_index)
+        file = discord.File(io.BytesIO(zoomed_bytes), filename=f"card_{self.card_index + 1}_zoom.png")
+
+        # Permitir cambiar de carta directamente desde la ventana de zoom
+        switch_view = discord.ui.View(timeout=180)
+        for idx in range(len(cards)):
+            btn = CardZoomButton(self.cache_id, idx)
+            btn.row = 0
+            if idx == self.card_index:
+                btn.style = discord.ButtonStyle.primary
+            switch_view.add_item(btn)
+
+        await interaction.followup.send(
+            content=f"🔎 **Inspecting Card #{self.card_index + 1} of {len(cards)}**",
+            file=file,
+            view=switch_view,
+            ephemeral=True,
+        )
+
+
 class ForumLinkView(discord.ui.View):
-    def __init__(self, post_url: str, meta: dict, pack_label: str, status: str = "none"):
+    def __init__(self, post_url: str, meta: dict, pack_label: str, cache_id: str = "", num_cards: int = 5, status: str = "none"):
         super().__init__(timeout=None)
         packs = meta.get("packs_count", "?")
         bot = meta.get("bot_name", "Bot")
@@ -737,22 +861,29 @@ class ForumLinkView(discord.ui.View):
         owner = meta.get("owner_display_name") or "unknown"
         prefix = "✅" if status == "alive" else ("❌" if status == "dead" else "")
         label = f"{prefix} {owner} | {pack_label} [{packs}P] {bot} [{game_id}]".strip()
-        self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url))
+
+        self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url, row=0))
+
+        if cache_id:
+            for i in range(num_cards):
+                self.add_item(CardZoomButton(cache_id, i))
 
 
 # =========================================================
-# SISTEMA DE VOTACIÓN ALIVE / DEAD
+# SISTEMA DE VOTACIÓN ALIVE / DEAD + ZOOM EN FORO
 # =========================================================
 
 async def load_vote_state(group: str) -> dict:
-    if group not in GROUP_CONFIG: return {}
+    if group not in GROUP_CONFIG:
+        return {}
     data = await redis_hgetall_json(vote_state_key(group))
     cutoff = time.time() - (72 * 60 * 60)
     return {k: v for k, v in data.items() if v.get("created_at", time.time()) >= cutoff}
 
 
 async def save_vote_state(group: str, data: dict) -> None:
-    if group not in GROUP_CONFIG: return
+    if group not in GROUP_CONFIG:
+        return
     for vote_key, state in data.items():
         await redis_hset_json(vote_state_key(group), vote_key, state)
 
@@ -760,10 +891,12 @@ async def save_vote_state(group: str, data: dict) -> None:
 async def update_gp_thread_status(thread_id: int, status: str):
     try:
         thread = client.get_channel(thread_id) or await client.fetch_channel(thread_id)
-        if thread is None: return
+        if thread is None:
+            return
         clean_name = thread.name.removeprefix("✅ ").removeprefix("❌ ").strip()
         new_name = f"✅ {clean_name}" if status == "alive" else (f"❌ {clean_name}" if status == "dead" else None)
-        if new_name: await thread.edit(name=new_name[:100])
+        if new_name:
+            await thread.edit(name=new_name[:100])
     except Exception:
         pass
 
@@ -773,26 +906,32 @@ async def update_main_link_button(state: dict, status: str, meta: dict, pack_lab
         channel_id = state.get("link_channel_id")
         message_id = state.get("link_message_id")
         post_url = state.get("post_url")
-        if not channel_id or not message_id or not post_url: return
+        if not channel_id or not message_id or not post_url:
+            return
 
         channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
         msg = await channel.fetch_message(int(message_id))
-        await msg.edit(view=ForumLinkView(post_url, meta, pack_label, status=status))
+        cache_id = state.get("cache_id", "")
+        num_cards = int(state.get("num_cards", 5))
+        await msg.edit(view=ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards, status=status))
     except Exception:
         pass
 
 
 class GPVoteView(discord.ui.View):
-    def __init__(self, vote_key: str, group: str):
+    def __init__(self, vote_key: str, group: str, num_cards: int = 5):
         super().__init__(timeout=None)
         self.vote_key = vote_key
         self.group = group
 
-    @discord.ui.button(label="🟢 Alive (0)", style=discord.ButtonStyle.success, custom_id="gp_alive")
+        for i in range(num_cards):
+            self.add_item(CardZoomButton(vote_key, i))
+
+    @discord.ui.button(label="🟢 Alive (0)", style=discord.ButtonStyle.success, custom_id="gp_alive", row=0)
     async def alive_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "alive")
 
-    @discord.ui.button(label="🔴 Dead (0)", style=discord.ButtonStyle.danger, custom_id="gp_dead")
+    @discord.ui.button(label="🔴 Dead (0)", style=discord.ButtonStyle.danger, custom_id="gp_dead", row=0)
     async def dead_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "dead")
 
@@ -806,8 +945,10 @@ class GPVoteView(discord.ui.View):
         if user_id in state["alive_users"] or user_id in state["dead_users"]:
             return await interaction.response.send_message("⚠️ You already voted on this God Pack.", ephemeral=True)
 
-        if vote_type == "alive": state["alive_users"].append(user_id)
-        else: state["dead_users"].append(user_id)
+        if vote_type == "alive":
+            state["alive_users"].append(user_id)
+        else:
+            state["dead_users"].append(user_id)
 
         alive_count = len(state["alive_users"])
         dead_count = len(state["dead_users"])
@@ -822,16 +963,25 @@ class GPVoteView(discord.ui.View):
         await save_vote_state(self.group, data)
 
         for child in self.children:
-            if child.custom_id == "gp_alive": child.label = f"🟢 Alive ({alive_count})"
-            elif child.custom_id == "gp_dead": child.label = f"🔴 Dead ({dead_count})"
+            if getattr(child, "custom_id", None) == "gp_alive":
+                child.label = f"🟢 Alive ({alive_count})"
+                if status in ("alive", "dead"):
+                    child.disabled = True
+            elif getattr(child, "custom_id", None) == "gp_dead":
+                child.label = f"🔴 Dead ({dead_count})"
+                if status in ("alive", "dead"):
+                    child.disabled = True
+
         if status in ("alive", "dead"):
             await update_gp_thread_status(int(self.vote_key), status)
             await update_main_link_button(state, status, state.get("meta", {}), state.get("pack_label", ""))
-            for child in self.children: child.disabled = True
 
         updated_embed = build_forum_info_embed(
-            state.get("meta", {}), state.get("pack_label", "[?/5]"), status=status,
-            alive_users=state["alive_users"], dead_users=state["dead_users"],
+            state.get("meta", {}),
+            state.get("pack_label", "[?/5]"),
+            status=status,
+            alive_users=state["alive_users"],
+            dead_users=state["dead_users"],
         )
         await interaction.response.edit_message(embed=updated_embed, view=self)
 
@@ -856,22 +1006,31 @@ async def restore_persistent_views():
         try:
             vote_data = await load_vote_state(group)
             for vote_key, state in vote_data.items():
-                view = GPVoteView(vote_key=str(vote_key), group=group)
+                num_c = int(state.get("num_cards", 5))
+                view = GPVoteView(vote_key=str(vote_key), group=group, num_cards=num_c)
                 alive_count = len(state.get("alive_users", []))
                 dead_count = len(state.get("dead_users", []))
                 for child in view.children:
-                    if child.custom_id == "gp_alive": child.label = f"🟢 Alive ({alive_count})"
-                    elif child.custom_id == "gp_dead": child.label = f"🔴 Dead ({dead_count})"
-                    if state.get("status") in ("alive", "dead"): child.disabled = True
+                    if getattr(child, "custom_id", None) == "gp_alive":
+                        child.label = f"🟢 Alive ({alive_count})"
+                        if state.get("status") in ("alive", "dead"):
+                            child.disabled = True
+                    elif getattr(child, "custom_id", None) == "gp_dead":
+                        child.label = f"🔴 Dead ({dead_count})"
+                        if state.get("status") in ("alive", "dead"):
+                            child.disabled = True
                 client.add_view(view)
                 restored += 1
         except Exception:
             pass
+    logger.info("✅ Views restauradas: %s", restored)
+
 
 @client.event
 async def on_ready():
-    logger.info("✅ Bot GP Lineal conectado como %s", client.user)
+    logger.info("✅ Bot GP Abanico Interactivo conectado como %s", client.user)
     await restore_persistent_views()
+
 
 @client.event
 async def on_message(message: discord.Message):
@@ -901,10 +1060,9 @@ async def on_message(message: discord.Message):
 
         group = CHANNEL_GROUP_MAP[message.channel.id]
 
-        linear_bytes, num_cards, was_already_linear = await asyncio.to_thread(
-            convert_gp_to_linear_bytes,
-            source_img
-        )
+        # Generar la imagen en modo Abanico y obtener las cartas individuales para el Zoom
+        fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
+        num_cards = len(extracted_cards)
 
         meta = parse_heartbeat_metadata(message.content or "")
         pack_label = build_pack_label_from_meta(meta)
@@ -933,15 +1091,21 @@ async def on_message(message: discord.Message):
             client,
             group,
             post_title,
-            linear_bytes,
-            filename="gp_linear.png"
+            fan_bytes,
+            filename="gp_fan.png",
         )
 
         post_url = None
+        cache_id = str(message.id)
+
         if post_data and post_data.get("thread"):
             post_thread = post_data["thread"]
             post_url = post_data["jump_url"]
             vote_key = str(post_thread.id)
+            cache_id = vote_key
+
+            # Guardar las cartas en caché asociadas al ID del post para el zoom interactivo
+            await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
@@ -963,24 +1127,31 @@ async def on_message(message: discord.Message):
                 "post_url": post_url,
                 "meta": meta,
                 "pack_label": pack_label,
+                "cache_id": cache_id,
+                "num_cards": num_cards,
             }
             await save_vote_state(group, vote_data)
 
-            vote_view = GPVoteView(vote_key=vote_key, group=group)
+            vote_view = GPVoteView(vote_key=vote_key, group=group, num_cards=num_cards)
             await post_thread.send(
                 content=mentions_text,
                 embed=info_embed,
                 view=vote_view,
-                allowed_mentions=discord.AllowedMentions(users=True)
+                allowed_mentions=discord.AllowedMentions(users=True),
             )
+        else:
+            await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
-        # Enviar la imagen final al canal y luego borrar el mensaje original
-        view = ForumLinkView(post_url, meta, pack_label) if post_url else None
-        main_file = discord.File(io.BytesIO(linear_bytes), filename="gp_linear.png")
-
+        # Enviar imagen en modo Abanico al canal principal con botón de enlace + botones de Zoom
+        view = (
+            ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
+            if post_url
+            else None
+        )
+        main_file = discord.File(io.BytesIO(fan_bytes), filename="gp_fan.png")
         sent_main = await message.channel.send(file=main_file, view=view)
 
-        # Borrado del mensaje crudo justo después de enviar la versión procesada
+        # Borrar el mensaje original del webhook inmediatamente
         try:
             await message.delete()
         except Exception:
@@ -996,6 +1167,7 @@ async def on_message(message: discord.Message):
 
     except Exception as e:
         logger.exception("🔥 Error procesando mensaje GP: %s", e)
+
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
