@@ -42,13 +42,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gp_linear_bot")
 
-# Dimensiones exactas para el modo lineal:
-# 4 cartas -> 1534 x 540
-# 5 cartas -> 1914 x 540 (mismo alto, mismo ancho por carta y mismo margen)
 LINEAR_HEIGHT = 540
 LINEAR_WIDTH_4_CARDS = 1534
 LINEAR_WIDTH_5_CARDS = 1914
-LINEAR_BG_COLOR = (16, 17, 36)  # Azul noche oscuro exacto del fondo original (#101124)
+LINEAR_BG_COLOR = (16, 17, 36)  # #101124
 
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
@@ -61,21 +58,15 @@ INVALID_LOG_COOLDOWN = 10
 INVALID_LOG_LAST_SENT = {}
 
 CHANNEL_GROUP_MAP = {
-    1564890852310913034: "Elite_Four",
+    1497179630027800728: "Elite_Four",
     1497179450960379915: "Trainer",
     1534456693126332568: "Gym_Leader",
 }
 
 GROUP_CONFIG = {
-    "Trainer": {
-        "FORUM_CHANNEL_ID": 1497177430828384396,
-    },
-    "Gym_Leader": {
-        "FORUM_CHANNEL_ID": 1501347022773686483,
-    },
-    "Elite_Four": {
-        "FORUM_CHANNEL_ID": 1564934929048019015,
-    },
+    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
+    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1497179653276827720},
 }
 
 group_locks = defaultdict(asyncio.Lock)
@@ -86,116 +77,64 @@ http_session: Optional[aiohttp.ClientSession] = None
 # =========================================================
 
 def is_already_linear_gp(img: Image.Image) -> bool:
-    """
-    Si la imagen ya viene en formato horizontal/lineal (ej. 1534x540, 1914x540 o 1270x300),
-    su relación ancho/alto es mayor o igual a 2.1.
-    """
     w, h = img.size
     if h == 0:
         return False
     return (w / h) >= 2.1
 
-
-def trim_card_borders(card_img: Image.Image, bg_rgb: np.ndarray, tolerance: float = 28.0) -> Image.Image:
-    """
-    Limpia cualquier borde residual del fondo oscuro alrededor de una carta recortada
-    para que encaje limpia en el lienzo lineal.
-    """
-    arr = np.array(card_img.convert("RGB"), dtype=np.float32)
-    diff = np.linalg.norm(arr - bg_rgb, axis=2)
-    mask = diff > tolerance
-
-    # Una fila o columna pertenece a la carta si al menos el 20% de sus píxeles no son fondo
-    row_has_card = mask.mean(axis=1) > 0.20
-    col_has_card = mask.mean(axis=0) > 0.20
-
-    if not np.any(row_has_card) or not np.any(col_has_card):
-        return card_img
-
-    y_indices = np.where(row_has_card)[0]
-    x_indices = np.where(col_has_card)[0]
-
-    y1, y2 = int(y_indices[0]), int(y_indices[-1]) + 1
-    x1, x2 = int(x_indices[0]), int(x_indices[-1]) + 1
-
-    # Solo aplicar recorte si conserva al menos el 75% del área esperada
-    h, w = arr.shape[:2]
-    if (x2 - x1) >= w * 0.75 and (y2 - y1) >= h * 0.75:
-        return card_img.crop((x1, y1, x2, y2))
-
-    return card_img
-
-
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
-    """
-    Detecta automáticamente si una imagen de GP en cuadrícula tiene 4 cartas (3 arriba, 1 abajo centrada)
-    o 5 cartas (3 arriba, 2 abajo) y devuelve la lista de imágenes de cada carta.
-    """
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
     arr = np.array(rgb_img, dtype=np.float32)
 
-    # Estimar el color de fondo tomando las esquinas inferiores donde nunca hay cartas
     corner_samples = np.concatenate([
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.01):int(w * 0.10)].reshape(-1, 3),
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.90):int(w * 0.99)].reshape(-1, 3),
     ], axis=0)
     bg_rgb = np.median(corner_samples, axis=0)
 
-    # Coordenadas normalizadas basadas en el layout nativo del emulador (3 arriba + fila inferior)
-    top_y1, top_y2 = 0.042, 0.489
-    bot_y1, bot_y2 = 0.500, 0.950
+    # Coordenadas ajustadas para evitar cortar los bordes inferiores
+    top_y1, top_y2 = 0.035, 0.490
+    bot_y1, bot_y2 = 0.510, 0.965
 
     top_x_boxes = [
-        (0.008, 0.330),  # Carta 1 (Arriba Izquierda)
-        (0.339, 0.661),  # Carta 2 (Arriba Centro)
-        (0.670, 0.992),  # Carta 3 (Arriba Derecha)
+        (0.015, 0.320),
+        (0.345, 0.655),
+        (0.675, 0.985),
     ]
 
-    # Medir presencia de cartas en la fila inferior para distinguir entre 4 cartas (Deluxe) y 5 cartas
-    # En 4 cartas: la carta inferior está en el centro [0.34 - 0.66], y los lados [0.10 - 0.25] están vacíos.
-    # En 5 cartas: las cartas inferiores ocupan [0.17 - 0.49] y [0.50 - 0.82].
     left_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.18):int(w * 0.30)]
     right_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.70):int(w * 0.82)]
 
     left_diff = float(np.mean(np.linalg.norm(left_outer_region - bg_rgb, axis=2)))
     right_diff = float(np.mean(np.linalg.norm(right_outer_region - bg_rgb, axis=2)))
 
-    # Si las regiones laterales inferiores tienen alto contraste respecto al fondo, hay 2 cartas abajo (Total = 5)
     is_five_cards = (left_diff > 25.0 and right_diff > 25.0)
 
     if is_five_cards:
         bot_x_boxes = [
-            (0.173, 0.495),  # Carta 4 (Abajo Izquierda)
-            (0.504, 0.826),  # Carta 5 (Abajo Derecha)
+            (0.180, 0.485),
+            (0.510, 0.815),
         ]
     else:
         bot_x_boxes = [
-            (0.339, 0.661),  # Carta 4 (Abajo Centro - Deluxe 4 cartas)
+            (0.345, 0.655),
         ]
 
     cards: List[Image.Image] = []
 
-    # Extraer las 3 cartas superiores
     for x1_rel, x2_rel in top_x_boxes:
         box = (int(round(x1_rel * w)), int(round(top_y1 * h)), int(round(x2_rel * w)), int(round(top_y2 * h)))
-        cropped = rgb_img.crop(box)
-        cards.append(trim_card_borders(cropped, bg_rgb))
+        cards.append(rgb_img.crop(box))
 
-    # Extraer 1 o 2 cartas inferiores
     for x1_rel, x2_rel in bot_x_boxes:
         box = (int(round(x1_rel * w)), int(round(bot_y1 * h)), int(round(x2_rel * w)), int(round(bot_y2 * h)))
-        cropped = rgb_img.crop(box)
-        cards.append(trim_card_borders(cropped, bg_rgb))
+        cards.append(rgb_img.crop(box))
 
     return cards
 
 
 def convert_gp_to_linear_bytes(source_img: Image.Image) -> Tuple[bytes, int, bool]:
-    """
-    Convierte la imagen del GP a formato lineal (1534x540 para 4 cartas, 1914x540 para 5 cartas).
-    Retorna: (image_bytes_png, num_cards_detected, was_already_linear)
-    """
     if is_already_linear_gp(source_img):
         buf = io.BytesIO()
         source_img.save(buf, format="PNG")
@@ -213,7 +152,7 @@ def convert_gp_to_linear_bytes(source_img: Image.Image) -> Tuple[bytes, int, boo
     margin_y = 15
     gap_x = 14
 
-    target_card_h = canvas_h - (2 * margin_y)  # 510 px
+    target_card_h = canvas_h - (2 * margin_y)
     total_gaps = gap_x * (num_cards - 1)
     target_card_w = (canvas_w - (2 * margin_x) - total_gaps) / num_cards
 
@@ -477,13 +416,9 @@ def names_match(input_name: str, user_data: dict) -> bool:
 
 
 async def resolve_rival_owner_by_game_id(game_id: str) -> Optional[dict]:
-    """
-    Soporta tanto el nuevo sistema 'rivals_sessions' como el antiguo 'rival_duos'.
-    """
     if not game_id:
         return None
 
-    # 1. Revisar sesiones activas del nuevo sistema Rivals
     try:
         rivals_sessions = await redis_hgetall_json("rivals_sessions")
         for sess_id, sess in rivals_sessions.items():
@@ -498,10 +433,9 @@ async def resolve_rival_owner_by_game_id(game_id: str) -> Optional[dict]:
                         "mention": f"<@{uid}>",
                         "game_id": game_id,
                     }
-    except Exception as e:
-        logger.warning("Error leyendo rivals_sessions: %s", e)
+    except Exception:
+        pass
 
-    # 2. Fallback al antiguo rival_duos
     try:
         rival_duos = await redis_hgetall_json("rival_duos")
         for duo_id, duo in rival_duos.items():
@@ -516,8 +450,8 @@ async def resolve_rival_owner_by_game_id(game_id: str) -> Optional[dict]:
                         "mention": f"<@{uid}>",
                         "game_id": game_id,
                     }
-    except Exception as e:
-        logger.warning("Error leyendo rival_duos: %s", e)
+    except Exception:
+        pass
 
     return None
 
@@ -566,30 +500,6 @@ async def resolve_gp_owner(client: discord.Client, content: str, group: str) -> 
     }
 
 
-async def find_registered_discord_user(discord_id: str, preferred_group: Optional[str] = None) -> Optional[dict]:
-    discord_id = str(discord_id or "").strip()
-    if not discord_id.isdigit():
-        return None
-
-    groups = [preferred_group] if preferred_group in GROUP_CONFIG else []
-    groups += [g for g in GROUP_CONFIG if g not in groups]
-    groups.append("Rivals")
-
-    for group in groups:
-        try:
-            users = await redis_hgetall_json(users_key(group))
-            if discord_id in users:
-                d = users[discord_id] or {}
-                return {
-                    "discord_id": discord_id,
-                    "group": group,
-                    "name": d.get("name") or d.get("heartbeatName") or discord_id,
-                }
-        except Exception:
-            continue
-    return None
-
-
 # =========================================================
 # GESTIÓN DE VIPS, STATS Y MENCIONES ONLINE
 # =========================================================
@@ -598,14 +508,12 @@ async def add_vip_id(friend_id: str, group: str) -> bool:
     friend_id = str(friend_id or "").strip()
     if not re.fullmatch(r"\d{16}", friend_id) or group not in GROUP_CONFIG:
         return False
-
     try:
         await redis_sadd_id(vip_key(group), friend_id)
         now_ts = int(datetime.now(timezone.utc).timestamp())
         await redis_command("hset", f"{vip_key(group)}:timestamps", friend_id, now_ts)
         return True
-    except Exception as e:
-        logger.exception("add_vip_id Redis error: %s", e)
+    except Exception:
         return False
 
 
@@ -627,15 +535,14 @@ async def cleanup_expired_vips(group: str):
                     await redis_command("hdel", ts_key, friend_id)
             except Exception:
                 pass
-    except Exception as e:
-        logger.exception("cleanup_expired_vips error: %s", e)
+    except Exception:
+        pass
 
 
 async def register_user_gp(owner_info: dict) -> None:
     discord_id = owner_info.get("discord_id")
     if not discord_id:
         return
-
     data = await redis_hgetall_json(gp_users_key())
     entry = data.get(discord_id, {"name": owner_info.get("display_name", "Unknown"), "gp": 0})
     entry["gp"] = int(entry.get("gp", 0)) + 1
@@ -646,7 +553,6 @@ async def register_user_gp(owner_info: dict) -> None:
 async def get_online_mentions(group: str) -> List[str]:
     if group not in GROUP_CONFIG:
         return []
-
     try:
         online_ids = await redis_smembers_ids(online_key(group))
         users = await load_group_users(group)
@@ -663,10 +569,8 @@ async def get_online_mentions(group: str) -> List[str]:
                 owner = await resolve_rival_owner_by_game_id(gid)
                 if owner and owner.get("mention") and owner["mention"] not in mentions:
                     mentions.append(owner["mention"])
-
         return mentions
-    except Exception as e:
-        logger.exception("get_online_mentions error: %s", e)
+    except Exception:
         return []
 
 
@@ -678,28 +582,16 @@ async def update_stats_safe(group: str, callback):
     async with group_locks[group]:
         stats = await redis_get_json(
             live_stats_key(group),
-            {
-                "totalGP": 0,
-                "totalAlive": 0,
-                "currentDay": None,
-                "daily": {"gp": 0, "alive": 0},
-                "history": [],
-                "processedMessages": [],
-            }
+            {"totalGP": 0, "totalAlive": 0, "currentDay": None, "daily": {"gp": 0, "alive": 0}, "history": [], "processedMessages": []}
         )
         today = get_utc6_date_string()
         if not stats.get("currentDay"):
             stats["currentDay"] = today
         elif stats["currentDay"] != today:
-            stats["history"].insert(0, {
-                "date": stats["currentDay"],
-                "gp": stats["daily"]["gp"],
-                "alive": stats["daily"]["alive"],
-            })
+            stats["history"].insert(0, {"date": stats["currentDay"], "gp": stats["daily"]["gp"], "alive": stats["daily"]["alive"]})
             stats["history"] = stats["history"][:5]
             stats["currentDay"] = today
             stats["daily"] = {"gp": 0, "alive": 0}
-
         stats = await callback(stats)
         await redis_set_json(live_stats_key(group), stats)
         return stats
@@ -730,21 +622,15 @@ def build_forum_info_embed(
     alive_users: Optional[List[str]] = None,
     dead_users: Optional[List[str]] = None,
 ) -> discord.Embed:
-    """
-    Construye un Embed limpio y reactivo para el post del foro con ID copiable en 1 toque.
-    """
     alive_users = alive_users or []
     dead_users = dead_users or []
 
     if status == "alive":
-        color = 0x2ECC71  # Verde Esmeralda
-        status_badge = "🟢 ALIVE (Verified)"
+        color, status_badge = 0x2ECC71, "🟢 ALIVE (Verified)"
     elif status == "dead":
-        color = 0xE74C3C  # Rojo
-        status_badge = "🔴 DEAD (Expired)"
+        color, status_badge = 0xE74C3C, "🔴 DEAD (Expired)"
     else:
-        color = 0xF1C40F  # Dorado / En espera de votos
-        status_badge = "⏳ PENDING TEST"
+        color, status_badge = 0xF1C40F, "⏳ PENDING TEST"
 
     obtainer_mention = meta.get("owner_mention") or meta.get("owner_display_name") or "Unknown"
     bot_name = meta.get("bot_name") or "UnknownBot"
@@ -754,30 +640,16 @@ def build_forum_info_embed(
     pack_name = meta.get("pack_name") or "DeluxeB"
     filename = meta.get("filename") or "unknown_file.xml"
 
-    embed = discord.Embed(
-        title=f"✨ GOD PACK {pack_label} [{packs_text}] — {pack_name}",
-        color=color,
-    )
-
+    embed = discord.Embed(title=f"✨ GOD PACK {pack_label} [{packs_text}] — {pack_name}", color=color)
     embed.add_field(name="👤 Found By", value=f"{obtainer_mention}", inline=True)
     embed.add_field(name="🤖 Instance", value=f"`{bot_name}`", inline=True)
     embed.add_field(name="📡 Status", value=f"**{status_badge}**", inline=True)
-
-    # Bloque de código dedicado solo al ID de 16 dígitos para copiar con 1 toque en móvil/PC
-    embed.add_field(
-        name="🆔 Friend ID (Tap to Copy)",
-        value=f"```\n{game_id}\n```",
-        inline=False,
-    )
+    embed.add_field(name="🆔 Friend ID (Tap to Copy)", value=f"```\n{game_id}\n```", inline=False)
 
     if alive_users or dead_users:
         alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "None"
         dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "None"
-        embed.add_field(
-            name="🗳️ Community Votes",
-            value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}",
-            inline=False,
-        )
+        embed.add_field(name="🗳️ Community Votes", value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}", inline=False)
 
     embed.set_footer(text=f"File: {filename}")
     return embed
@@ -797,15 +669,10 @@ async def create_forum_post_with_image_bytes(
             return None
 
         file = discord.File(io.BytesIO(image_bytes), filename=filename)
-        created = await channel.create_thread(
-            name=title[:100],
-            content="‎",
-            file=file,
-        )
+        created = await channel.create_thread(name=title[:100], content="‎", file=file)
         thread = created.thread if hasattr(created, "thread") else created
         return {"thread": thread, "jump_url": thread.jump_url}
-    except Exception as e:
-        logger.exception("No se pudo crear el post del foro: %s", e)
+    except Exception:
         return None
 
 
@@ -816,17 +683,9 @@ class ForumLinkView(discord.ui.View):
         bot = meta.get("bot_name", "Bot")
         game_id = meta.get("game_id", "ID")
         owner = meta.get("owner_display_name") or "unknown"
-
         prefix = "✅" if status == "alive" else ("❌" if status == "dead" else "")
         label = f"{prefix} {owner} | {pack_label} [{packs}P] {bot} [{game_id}]".strip()
-
-        self.add_item(
-            discord.ui.Button(
-                label=label[:80],
-                style=discord.ButtonStyle.link,
-                url=post_url,
-            )
-        )
+        self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url))
 
 
 # =========================================================
@@ -834,16 +693,14 @@ class ForumLinkView(discord.ui.View):
 # =========================================================
 
 async def load_vote_state(group: str) -> dict:
-    if group not in GROUP_CONFIG:
-        return {}
+    if group not in GROUP_CONFIG: return {}
     data = await redis_hgetall_json(vote_state_key(group))
     cutoff = time.time() - (72 * 60 * 60)
     return {k: v for k, v in data.items() if v.get("created_at", time.time()) >= cutoff}
 
 
 async def save_vote_state(group: str, data: dict) -> None:
-    if group not in GROUP_CONFIG:
-        return
+    if group not in GROUP_CONFIG: return
     for vote_key, state in data.items():
         await redis_hset_json(vote_state_key(group), vote_key, state)
 
@@ -851,18 +708,12 @@ async def save_vote_state(group: str, data: dict) -> None:
 async def update_gp_thread_status(thread_id: int, status: str):
     try:
         thread = client.get_channel(thread_id) or await client.fetch_channel(thread_id)
-        if thread is None:
-            return
+        if thread is None: return
         clean_name = thread.name.removeprefix("✅ ").removeprefix("❌ ").strip()
-        if status == "alive":
-            new_name = f"✅ {clean_name}"
-        elif status == "dead":
-            new_name = f"❌ {clean_name}"
-        else:
-            return
-        await thread.edit(name=new_name[:100])
-    except Exception as e:
-        logger.warning("No se pudo renombrar thread %s: %s", thread_id, e)
+        new_name = f"✅ {clean_name}" if status == "alive" else (f"❌ {clean_name}" if status == "dead" else None)
+        if new_name: await thread.edit(name=new_name[:100])
+    except Exception:
+        pass
 
 
 async def update_main_link_button(state: dict, status: str, meta: dict, pack_label: str):
@@ -870,15 +721,13 @@ async def update_main_link_button(state: dict, status: str, meta: dict, pack_lab
         channel_id = state.get("link_channel_id")
         message_id = state.get("link_message_id")
         post_url = state.get("post_url")
-        if not channel_id or not message_id or not post_url:
-            return
+        if not channel_id or not message_id or not post_url: return
 
         channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
         msg = await channel.fetch_message(int(message_id))
-        new_view = ForumLinkView(post_url, meta, pack_label, status=status)
-        await msg.edit(view=new_view)
-    except Exception as e:
-        logger.warning("No se pudo actualizar botón link: %s", e)
+        await msg.edit(view=ForumLinkView(post_url, meta, pack_label, status=status))
+    except Exception:
+        pass
 
 
 class GPVoteView(discord.ui.View):
@@ -898,30 +747,19 @@ class GPVoteView(discord.ui.View):
     async def handle_vote(self, interaction: discord.Interaction, vote_type: str):
         data = await load_vote_state(self.group)
         state = data.get(self.vote_key)
-
         if not state:
-            await interaction.response.send_message("❌ Vote state not found.", ephemeral=True)
-            return
+            return await interaction.response.send_message("❌ Vote state not found.", ephemeral=True)
 
         user_id = str(interaction.user.id)
         if user_id in state["alive_users"] or user_id in state["dead_users"]:
-            await interaction.response.send_message("⚠️ You already voted on this God Pack.", ephemeral=True)
-            return
+            return await interaction.response.send_message("⚠️ You already voted on this God Pack.", ephemeral=True)
 
-        if vote_type == "alive":
-            state["alive_users"].append(user_id)
-        else:
-            state["dead_users"].append(user_id)
+        if vote_type == "alive": state["alive_users"].append(user_id)
+        else: state["dead_users"].append(user_id)
 
         alive_count = len(state["alive_users"])
         dead_count = len(state["dead_users"])
-        status = state.get("status", "none")
-
-        if alive_count >= 1:
-            status = "alive"
-        elif dead_count >= 4:
-            status = "dead"
-
+        status = "alive" if alive_count >= 1 else ("dead" if dead_count >= 4 else state.get("status", "none"))
         state["status"] = status
 
         if status == "alive" and not state.get("counted_alive", False):
@@ -932,101 +770,23 @@ class GPVoteView(discord.ui.View):
         await save_vote_state(self.group, data)
 
         for child in self.children:
-            if child.custom_id == "gp_alive":
-                child.label = f"🟢 Alive ({alive_count})"
-            elif child.custom_id == "gp_dead":
-                child.label = f"🔴 Dead ({dead_count})"
-
+            if child.custom_id == "gp_alive": child.label = f"🟢 Alive ({alive_count})"
+            elif child.custom_id == "gp_dead": child.label = f"🔴 Dead ({dead_count})"
         if status in ("alive", "dead"):
             await update_gp_thread_status(int(self.vote_key), status)
             await update_main_link_button(state, status, state.get("meta", {}), state.get("pack_label", ""))
-            for child in self.children:
-                child.disabled = True
+            for child in self.children: child.disabled = True
 
         updated_embed = build_forum_info_embed(
-            state.get("meta", {}),
-            state.get("pack_label", "[?/5]"),
-            status=status,
-            alive_users=state["alive_users"],
-            dead_users=state["dead_users"],
+            state.get("meta", {}), state.get("pack_label", "[?/5]"), status=status,
+            alive_users=state["alive_users"], dead_users=state["dead_users"],
         )
-
         await interaction.response.edit_message(embed=updated_embed, view=self)
 
     async def _increment_alive(self, stats: dict) -> dict:
         stats["totalAlive"] += 1
         stats["daily"]["alive"] += 1
         return stats
-
-
-# =========================================================
-# LOGS Y MANEJO DE ERRORES
-# =========================================================
-
-async def forward_invalid_message(message: discord.Message, reason: str):
-    if not INVALID_LOG_CHANNEL_ID:
-        return
-
-    original_text = message.content or "(sin texto)"
-    tagged_user = None
-    owner_id = extract_owner_discord_id_from_first_line(original_text)
-
-    if owner_id:
-        try:
-            tagged_user = await find_registered_discord_user(
-                owner_id,
-                get_group_from_channel(message.channel.id)
-            )
-        except Exception:
-            pass
-
-    cooldown_key = f"{message.channel.id}:{tagged_user['discord_id']}" if tagged_user else str(message.channel.id)
-    now = time.monotonic()
-    if now - INVALID_LOG_LAST_SENT.get(cooldown_key, 0) < INVALID_LOG_COOLDOWN:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
-
-    INVALID_LOG_LAST_SENT[cooldown_key] = now
-
-    try:
-        log_channel = client.get_channel(INVALID_LOG_CHANNEL_ID) or await client.fetch_channel(INVALID_LOG_CHANNEL_ID)
-        if log_channel is None:
-            return
-
-        mention_line = f"<@{tagged_user['discord_id']}>\n" if tagged_user else ""
-        allowed = (
-            discord.AllowedMentions(users=[discord.Object(id=int(tagged_user["discord_id"]))])
-            if tagged_user
-            else discord.AllowedMentions.none()
-        )
-
-        content = (
-            f"{mention_line}"
-            f"**Rejected message from channel <#{message.channel.id}>**\n"
-            f"**Author:** {message.author} (`{message.author.id}`)\n"
-            f"**Reason:** {reason}\n\n"
-            f"**Original message:**\n"
-            f"```{original_text[:1300]}```"
-        )
-
-        await log_channel.send(content=content, allowed_mentions=allowed)
-        try:
-            await message.delete()
-        except Exception:
-            pass
-    except Exception as e:
-        logger.exception("Error reenviando mensaje inválido: %s", e)
-
-
-async def delete_message_later(message: discord.Message, delay_seconds: int = 172800):
-    try:
-        await asyncio.sleep(delay_seconds)
-        await message.delete()
-    except Exception:
-        pass
 
 
 # =========================================================
@@ -1047,28 +807,19 @@ async def restore_persistent_views():
                 view = GPVoteView(vote_key=str(vote_key), group=group)
                 alive_count = len(state.get("alive_users", []))
                 dead_count = len(state.get("dead_users", []))
-
                 for child in view.children:
-                    if child.custom_id == "gp_alive":
-                        child.label = f"🟢 Alive ({alive_count})"
-                    elif child.custom_id == "gp_dead":
-                        child.label = f"🔴 Dead ({dead_count})"
-                    if state.get("status") in ("alive", "dead"):
-                        child.disabled = True
-
+                    if child.custom_id == "gp_alive": child.label = f"🟢 Alive ({alive_count})"
+                    elif child.custom_id == "gp_dead": child.label = f"🔴 Dead ({dead_count})"
+                    if state.get("status") in ("alive", "dead"): child.disabled = True
                 client.add_view(view)
                 restored += 1
-        except Exception as e:
-            logger.exception("Error restaurando views de %s: %s", group, e)
-
-    logger.info("✅ Views restauradas: %s", restored)
-
+        except Exception:
+            pass
 
 @client.event
 async def on_ready():
     logger.info("✅ Bot GP Lineal conectado como %s", client.user)
     await restore_persistent_views()
-
 
 @client.event
 async def on_message(message: discord.Message):
@@ -1076,12 +827,9 @@ async def on_message(message: discord.Message):
         if message.author.id == client.user.id or message.id in PROCESSED_MESSAGES:
             return
 
-        if not is_target_message(message):
-            if message.webhook_id is not None and message.channel.id in CHANNEL_GROUP_MAP:
-                await forward_invalid_message(message, "No God Pack.")
+        if message.webhook_id is None or message.channel.id not in CHANNEL_GROUP_MAP:
             return
 
-        # Verificar que tenga al menos una imagen adjunta válida
         image_attachments = [
             att for att in message.attachments
             if (att.content_type or "").lower().startswith("image/")
@@ -1089,10 +837,6 @@ async def on_message(message: discord.Message):
         ]
 
         if not image_attachments:
-            await forward_invalid_message(
-                message,
-                "El mensaje coincide con el formato de GP, pero no contiene una imagen válida."
-            )
             return
 
         first_att = image_attachments[0]
@@ -1103,18 +847,14 @@ async def on_message(message: discord.Message):
         if len(PROCESSED_MESSAGES) > 1000:
             PROCESSED_MESSAGES.clear()
 
-        group = get_group_from_channel(message.channel.id)
-        if not group:
-            return
+        group = CHANNEL_GROUP_MAP[message.channel.id]
 
-        # 1. Convertir la imagen a formato lineal en un hilo aparte (o dejarla pasar si ya es lineal)
         linear_bytes, num_cards, was_already_linear = await asyncio.to_thread(
             convert_gp_to_linear_bytes,
             source_img
         )
 
         meta = parse_heartbeat_metadata(message.content or "")
-        # Si el sobre tiene 4 cartas y el texto decía /5 o no tenía total, ajustamos el label
         pack_label = build_pack_label_from_meta(meta)
 
         await cleanup_expired_vips(group)
@@ -1131,13 +871,11 @@ async def on_message(message: discord.Message):
         meta["owner_display_name"] = owner_info.get("display_name")
         meta["owner_mention"] = owner_info.get("mention")
 
-        # 2. Registrar VIP y Estadísticas
         if friend_id:
             await add_vip_id(friend_id, group)
         await register_user_gp(owner_info)
         await update_stats_safe(group, increment_gp_callback)
 
-        # 3. Crear el Post en el Foro con la imagen lineal
         post_title = build_post_title(meta, pack_label)
         post_data = await create_forum_post_with_image_bytes(
             client,
@@ -1184,11 +922,17 @@ async def on_message(message: discord.Message):
                 allowed_mentions=discord.AllowedMentions(users=True)
             )
 
-        # 4. Publicar la imagen lineal con el botón de enlace en el canal principal
+        # Enviar la imagen final al canal y luego borrar el mensaje original
         view = ForumLinkView(post_url, meta, pack_label) if post_url else None
         main_file = discord.File(io.BytesIO(linear_bytes), filename="gp_linear.png")
 
         sent_main = await message.channel.send(file=main_file, view=view)
+
+        # Borrado del mensaje crudo justo después de enviar la versión procesada
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
         if post_data and sent_main:
             vote_key = str(post_data["thread"].id)
@@ -1198,32 +942,8 @@ async def on_message(message: discord.Message):
                 vote_data[vote_key]["link_channel_id"] = sent_main.channel.id
                 await save_vote_state(group, vote_data)
 
-        # 5. Enviar respaldo al canal de logs si está activo
-        if LOG_CHANNEL_ID:
-            log_channel = client.get_channel(LOG_CHANNEL_ID) or await client.fetch_channel(LOG_CHANNEL_ID)
-            if log_channel:
-                mode_str = "Direct Linear Passthrough" if was_already_linear else f"Converted Grid -> Linear ({num_cards} cards)"
-                log_text = (
-                    f"**GP Processed ({mode_str})**\n"
-                    f"User: {meta.get('owner_mention')}\n"
-                    f"Bot: `{meta.get('bot_name')} ({friend_id})`\n"
-                    f"Pack: `{pack_label} [{meta.get('packs_count', '?')}P]`"
-                )
-                sent_log = await log_channel.send(
-                    content=log_text,
-                    file=discord.File(io.BytesIO(raw_bytes), filename=first_att.filename)
-                )
-                asyncio.create_task(delete_message_later(sent_log, 172800))
-
-        # 6. Borrar el mensaje crudo del webhook
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
     except Exception as e:
         logger.exception("🔥 Error procesando mensaje GP: %s", e)
-
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
