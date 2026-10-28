@@ -1,1 +1,1 @@
-worker: python GPmod.py
+worker: python gpmod.py
