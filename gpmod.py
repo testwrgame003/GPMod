@@ -82,6 +82,30 @@ def is_already_linear_gp(img: Image.Image) -> bool:
         return False
     return (w / h) >= 2.1
 
+def trim_card_borders(card_img: Image.Image, bg_rgb: np.ndarray, tolerance: float = 28.0) -> Image.Image:
+    """Limpia el borde residual del fondo oscuro alrededor de una carta recortada."""
+    arr = np.array(card_img.convert("RGB"), dtype=np.float32)
+    diff = np.linalg.norm(arr - bg_rgb, axis=2)
+    mask = diff > tolerance
+
+    # Reducido al 15% para que detecte mejor los bordes muy oscuros de algunas cartas
+    row_has_card = mask.mean(axis=1) > 0.15
+    col_has_card = mask.mean(axis=0) > 0.15
+
+    if not np.any(row_has_card) or not np.any(col_has_card):
+        return card_img
+
+    y_indices = np.where(row_has_card)[0]
+    x_indices = np.where(col_has_card)[0]
+    y1, y2 = int(y_indices[0]), int(y_indices[-1]) + 1
+    x1, x2 = int(x_indices[0]), int(x_indices[-1]) + 1
+
+    h, w = arr.shape[:2]
+    if (x2 - x1) >= w * 0.75 and (y2 - y1) >= h * 0.75:
+        return card_img.crop((x1, y1, x2, y2))
+    return card_img
+
+
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
@@ -93,9 +117,9 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
     ], axis=0)
     bg_rgb = np.median(corner_samples, axis=0)
 
-    # Coordenadas ajustadas para evitar cortar los bordes inferiores
-    top_y1, top_y2 = 0.035, 0.490
-    bot_y1, bot_y2 = 0.510, 0.965
+    # Coordenadas ampliadas más hacia abajo (y2) para asegurar que tome la carta completa antes de aplicar el trim
+    top_y1, top_y2 = 0.035, 0.510
+    bot_y1, bot_y2 = 0.495, 0.980
 
     top_x_boxes = [
         (0.015, 0.320),
@@ -105,31 +129,23 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 
     left_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.18):int(w * 0.30)]
     right_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.70):int(w * 0.82)]
-
     left_diff = float(np.mean(np.linalg.norm(left_outer_region - bg_rgb, axis=2)))
     right_diff = float(np.mean(np.linalg.norm(right_outer_region - bg_rgb, axis=2)))
 
     is_five_cards = (left_diff > 25.0 and right_diff > 25.0)
-
     if is_five_cards:
-        bot_x_boxes = [
-            (0.180, 0.485),
-            (0.510, 0.815),
-        ]
+        bot_x_boxes = [(0.180, 0.485), (0.510, 0.815)]
     else:
-        bot_x_boxes = [
-            (0.345, 0.655),
-        ]
+        bot_x_boxes = [(0.345, 0.655)]
 
     cards: List[Image.Image] = []
-
     for x1_rel, x2_rel in top_x_boxes:
         box = (int(round(x1_rel * w)), int(round(top_y1 * h)), int(round(x2_rel * w)), int(round(top_y2 * h)))
-        cards.append(rgb_img.crop(box))
+        cards.append(trim_card_borders(rgb_img.crop(box), bg_rgb))
 
     for x1_rel, x2_rel in bot_x_boxes:
         box = (int(round(x1_rel * w)), int(round(bot_y1 * h)), int(round(x2_rel * w)), int(round(bot_y2 * h)))
-        cards.append(rgb_img.crop(box))
+        cards.append(trim_card_borders(rgb_img.crop(box), bg_rgb))
 
     return cards
 
