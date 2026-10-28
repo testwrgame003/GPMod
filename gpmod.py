@@ -67,15 +67,15 @@ INVALID_LOG_COOLDOWN = 10
 INVALID_LOG_LAST_SENT = {}
 
 CHANNEL_GROUP_MAP = {
-    1564890852310913034: "Elite_Four",
+    1497179630027800728: "Elite_Four",
     1497179450960379915: "Trainer",
     1534456693126332568: "Gym_Leader",
 }
 
 GROUP_CONFIG = {
-    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396, "LABEL": "Trainer"},
-    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483, "LABEL": "Gym Leader"},
-    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015, "LABEL": "Elite Four"},
+    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
+    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1497179653276827720},
 }
 
 group_locks = defaultdict(asyncio.Lock)
@@ -170,10 +170,6 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 # =========================================================
 
 def create_fan_canvas(width: int, height: int, transparent: bool = True) -> Image.Image:
-    """
-    Si transparent=True, devuelve un lienzo RGBA 100% transparente.
-    Si transparent=False, crea el fondo azul noche con iluminación radial.
-    """
     if transparent:
         return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
@@ -239,10 +235,6 @@ def paste_rotated_card_with_shadow(
 
 
 def build_fan_image(cards: List[Image.Image], transparent: Optional[bool] = None) -> Image.Image:
-    """
-    Construye el abanico de 4 o 5 cartas. Respeta TRANSPARENT_BACKGROUND para dejar
-    el fondo transparente (RGBA) o sólido (RGB).
-    """
     use_transparent = TRANSPARENT_BACKGROUND if transparent is None else transparent
     num_cards = len(cards)
     canvas = create_fan_canvas(FAN_CANVAS_W, FAN_CANVAS_H, transparent=use_transparent)
@@ -271,19 +263,12 @@ def build_fan_image(cards: List[Image.Image], transparent: Optional[bool] = None
 
 
 def build_inspected_card_image(cards: List[Image.Image], selected_index: int) -> bytes:
-    """
-    Recrea el efecto del juego al mantener presionada una carta:
-    Si TRANSPARENT_BACKGROUND está activo, atenúa y desenfoca el abanico manteniendo
-    el fondo transparente para que la carta seleccionada resalte en el centro.
-    """
     fan_base = build_fan_image(cards, transparent=TRANSPARENT_BACKGROUND).convert("RGBA")
 
-    # Oscurecer únicamente los canales RGB del abanico de fondo sin perder su transparencia
     r, g, b, a = fan_base.split()
     rgb_dark = ImageEnhance.Brightness(Image.merge("RGB", (r, g, b))).enhance(0.35)
     dr, dg, db = rgb_dark.split()
     if TRANSPARENT_BACKGROUND:
-        # Reducir opacidad del abanico trasero para darle foco total a la carta central
         a = a.point(lambda p: int(p * 0.55))
     dimmed_fan = Image.merge("RGBA", (dr, dg, db, a))
     blurred_bg = dimmed_fan.filter(ImageFilter.GaussianBlur(radius=10))
@@ -744,7 +729,7 @@ async def increment_gp_callback(stats: dict) -> dict:
 
 
 # =========================================================
-# PANEL EMBED REDISEÑADO PARA EL FORO + BOTONES DE ZOOM E HILO
+# PANEL EMBED REDISEÑADO Y MINIMALISTA
 # =========================================================
 
 def build_post_title(meta: dict, pack_label: str) -> str:
@@ -761,86 +746,52 @@ def build_forum_info_embed(
     status: str = "none",
     alive_users: Optional[List[str]] = None,
     dead_users: Optional[List[str]] = None,
-    group: str = "Elite_Four",
-    created_at_ts: Optional[int] = None,
 ) -> discord.Embed:
     """
-    Panel visual mejorado para el post del foro:
-    - Cambia 'Instance' por '🏷️ Nickname'
-    - Incluye barra visual de estado y tiempo relativo en vivo
-    - Bloque limpio de 1 toque para copiar el Friend ID
+    Panel limpio y directo. Oculta iconos y barras gigantes.
+    Muestra únicamente lo relevante.
     """
     alive_users = alive_users or []
     dead_users = dead_users or []
-    ts = created_at_ts or int(time.time())
 
     if status == "alive":
-        color = 0x2ECC71  # Esmeralda brillante
-        status_badge = "✅ VERIFIED ALIVE"
-        progress_bar = "🟩🟩🟩🟩🟩🟩🟩🟩"
+        color = 0x2ECC71
+        status_text = "✅ VERIFIED ALIVE"
     elif status == "dead":
-        color = 0xE74C3C  # Rojo carmesí
-        status_badge = "💀 CONFIRMED DEAD"
-        progress_bar = "🟥🟥🟥🟥🟥🟥🟥🟥"
+        color = 0xE74C3C
+        status_text = "💀 CONFIRMED DEAD"
     else:
-        color = 0xF1C40F  # Dorado ámbar
-        dead_progress = min(len(dead_users), 4)
-        progress_bar = ("🟧" * (dead_progress * 2)) + ("⬛" * (8 - dead_progress * 2)) if dead_progress else "🟨🟨⬛⬛⬛⬛⬛⬛"
-        status_badge = f"⏳ WAITING FOR TEST ({len(dead_users)}/4 Dead)"
+        color = 0xF1C40F
+        status_text = "⏳ WAITING FOR TEST"
 
     obtainer_mention = meta.get("owner_mention") or meta.get("owner_display_name") or "Unknown"
     nickname = meta.get("bot_name") or "Unknown"
     game_id = meta.get("game_id") or "UnknownID"
-    packs_count = meta.get("packs_count")
-    packs_text = f"{packs_count} Packs" if packs_count is not None else "? Packs"
-    pack_name = meta.get("pack_name") or "DeluxeB"
-    filename = meta.get("filename") or "unknown_file.xml"
-    group_label = GROUP_CONFIG.get(group, {}).get("LABEL", group.replace("_", " "))
 
     embed = discord.Embed(
-        title=f"✨ {group_label.upper()} — GOD PACK {pack_label}",
-        description=(
-            f"> 📦 **Expansion:** `{pack_name}`  •  🎯 **Pulls:** `{packs_text}`  •  🕒 **Found:** <t:{ts}:R>\n"
-            f"> {progress_bar}  **{status_badge}**"
-        ),
+        title=f"✨ GOD PACK {pack_label}  |  {status_text}",
         color=color,
     )
 
-    embed.add_field(
-        name="👑 Found By",
-        value=f"> {obtainer_mention}",
-        inline=True,
-    )
-    embed.add_field(
-        name="🏷️ Nickname",
-        value=f"> `{nickname}`",
-        inline=True,
-    )
-    embed.add_field(
-        name="🎴 Rarity",
-        value=f"> `{pack_label}`",
-        inline=True,
-    )
+    embed.add_field(name="👤 Found By", value=obtainer_mention, inline=True)
+    embed.add_field(name="🏷️ Nickname", value=f"`{nickname}`", inline=True)
 
-    # Bloque dedicado exclusivamente a los 16 dígitos para copiar con 1 toque en móvil y PC
+    # El Friend ID listo para copiar con un solo toque (estilo código)
     embed.add_field(
         name="📲 Friend ID (Tap to Copy)",
         value=f"```\n{game_id}\n```",
         inline=False,
     )
 
-    alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "*No votes yet*"
-    dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "*No votes yet*"
+    alive_str = " ".join(f"<@{u}>" for u in alive_users) if alive_users else "-"
+    dead_str = " ".join(f"<@{u}>" for u in dead_users) if dead_users else "-"
+
     embed.add_field(
-        name="🗳️ Live Community Verification",
-        value=(
-            f"🟢 **Alive ({len(alive_users)}/1):** {alive_str}\n"
-            f"🔴 **Dead ({len(dead_users)}/4):** {dead_str}"
-        ),
+        name="🗳️ Verification Votes",
+        value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}",
         inline=False,
     )
 
-    embed.set_footer(text=f"🔍 Click buttons 1-5 below to inspect each card in HD  •  📄 {filename}")
     return embed
 
 
@@ -923,7 +874,7 @@ class ForumLinkView(discord.ui.View):
 
 
 # =========================================================
-# SISTEMA DE VOTACIÓN ALIVE / DEAD + ZOOM EN FORO
+# SISTEMA DE VOTACIÓN ALIVE / DEAD CON CUSTOM_IDS DINÁMICOS
 # =========================================================
 
 async def load_vote_state(group: str) -> dict:
@@ -977,15 +928,32 @@ class GPVoteView(discord.ui.View):
         self.vote_key = vote_key
         self.group = group
 
+        # Usamos Custom IDs dinámicos para evitar colisiones entre botones de distintos hilos
+        self.btn_alive = discord.ui.Button(
+            label="🟢 Alive (0)", 
+            style=discord.ButtonStyle.success, 
+            custom_id=f"gp_alive_{vote_key}", 
+            row=0
+        )
+        self.btn_alive.callback = self.alive_callback
+        self.add_item(self.btn_alive)
+
+        self.btn_dead = discord.ui.Button(
+            label="🔴 Dead (0)", 
+            style=discord.ButtonStyle.danger, 
+            custom_id=f"gp_dead_{vote_key}", 
+            row=0
+        )
+        self.btn_dead.callback = self.dead_callback
+        self.add_item(self.btn_dead)
+
         for i in range(num_cards):
             self.add_item(CardZoomButton(vote_key, i))
 
-    @discord.ui.button(label="🟢 Alive (0)", style=discord.ButtonStyle.success, custom_id="gp_alive", row=0)
-    async def alive_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def alive_callback(self, interaction: discord.Interaction):
         await self.handle_vote(interaction, "alive")
 
-    @discord.ui.button(label="🔴 Dead (0)", style=discord.ButtonStyle.danger, custom_id="gp_dead", row=0)
-    async def dead_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def dead_callback(self, interaction: discord.Interaction):
         await self.handle_vote(interaction, "dead")
 
     async def handle_vote(self, interaction: discord.Interaction, vote_type: str):
@@ -1015,29 +983,22 @@ class GPVoteView(discord.ui.View):
         data[self.vote_key] = state
         await save_vote_state(self.group, data)
 
-        for child in self.children:
-            if getattr(child, "custom_id", None) == "gp_alive":
-                child.label = f"🟢 Alive ({alive_count})"
-                if status in ("alive", "dead"):
-                    child.disabled = True
-            elif getattr(child, "custom_id", None) == "gp_dead":
-                child.label = f"🔴 Dead ({dead_count})"
-                if status in ("alive", "dead"):
-                    child.disabled = True
-
+        # Actualizar etiquetas de los botones dinámicamente
+        self.btn_alive.label = f"🟢 Alive ({alive_count})"
+        self.btn_dead.label = f"🔴 Dead ({dead_count})"
+        
         if status in ("alive", "dead"):
+            self.btn_alive.disabled = True
+            self.btn_dead.disabled = True
             await update_gp_thread_status(int(self.vote_key), status)
             await update_main_link_button(state, status, state.get("meta", {}), state.get("pack_label", ""))
 
-        created_ts = int(state.get("created_at", time.time()))
         updated_embed = build_forum_info_embed(
             state.get("meta", {}),
             state.get("pack_label", "[?/5]"),
             status=status,
             alive_users=state["alive_users"],
             dead_users=state["dead_users"],
-            group=self.group,
-            created_at_ts=created_ts,
         )
         await interaction.response.edit_message(embed=updated_embed, view=self)
 
@@ -1055,7 +1016,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-
 async def restore_persistent_views():
     restored = 0
     for group in GROUP_CONFIG.keys():
@@ -1066,15 +1026,14 @@ async def restore_persistent_views():
                 view = GPVoteView(vote_key=str(vote_key), group=group, num_cards=num_c)
                 alive_count = len(state.get("alive_users", []))
                 dead_count = len(state.get("dead_users", []))
-                for child in view.children:
-                    if getattr(child, "custom_id", None) == "gp_alive":
-                        child.label = f"🟢 Alive ({alive_count})"
-                        if state.get("status") in ("alive", "dead"):
-                            child.disabled = True
-                    elif getattr(child, "custom_id", None) == "gp_dead":
-                        child.label = f"🔴 Dead ({dead_count})"
-                        if state.get("status") in ("alive", "dead"):
-                            child.disabled = True
+                
+                view.btn_alive.label = f"🟢 Alive ({alive_count})"
+                view.btn_dead.label = f"🔴 Dead ({dead_count})"
+                
+                if state.get("status") in ("alive", "dead"):
+                    view.btn_alive.disabled = True
+                    view.btn_dead.disabled = True
+                
                 client.add_view(view)
                 restored += 1
         except Exception:
@@ -1154,7 +1113,6 @@ async def on_message(message: discord.Message):
 
         post_url = None
         cache_id = str(message.id)
-        now_ts = int(time.time())
 
         if post_data and post_data.get("thread"):
             post_thread = post_data["thread"]
@@ -1167,17 +1125,11 @@ async def on_message(message: discord.Message):
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
 
-            info_embed = build_forum_info_embed(
-                meta,
-                pack_label,
-                status="none",
-                group=group,
-                created_at_ts=now_ts,
-            )
+            info_embed = build_forum_info_embed(meta, pack_label, status="none")
 
             vote_data = await load_vote_state(group)
             vote_data[vote_key] = {
-                "created_at": now_ts,
+                "created_at": time.time(),
                 "group": group,
                 "owner_discord_id": owner_info.get("discord_id"),
                 "friend_id": friend_id,
