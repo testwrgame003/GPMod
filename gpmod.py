@@ -73,13 +73,87 @@ CHANNEL_GROUP_MAP = {
 }
 
 GROUP_CONFIG = {
-    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
-    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
-    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015},
+    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396, "LABEL": "Trainer"},
+    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483, "LABEL": "Gym Leader"},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015, "LABEL": "Elite Four"},
 }
 
 group_locks = defaultdict(asyncio.Lock)
 http_session: Optional[aiohttp.ClientSession] = None
+
+# =========================================================
+# RUTINAS DE VALIDACIÓN Y LOGS DE ERRORES / REGISTRO
+# =========================================================
+
+def is_target_message(message: discord.Message) -> bool:
+    if message.webhook_id is None:
+        return False
+    if message.channel.id not in CHANNEL_GROUP_MAP:
+        return False
+    content = message.content or ""
+    if any(pattern.search(content) for pattern in TRIGGER_PATTERNS):
+        return True
+    if len(message.attachments) > 0:
+        return True
+    return False
+
+async def delete_message_later(msg: discord.Message, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+async def forward_invalid_message(message: discord.Message, reason: str):
+    if not INVALID_LOG_CHANNEL_ID:
+        return
+
+    original_text = message.content or "(sin texto)"
+    owner_id = extract_owner_discord_id_from_first_line(original_text)
+
+    tagged_user = None
+    if owner_id:
+        try:
+            tagged_user = await resolve_gp_owner(client, original_text, CHANNEL_GROUP_MAP.get(message.channel.id, "Elite_Four"))
+        except Exception:
+            pass
+
+    cooldown_key = f"{message.channel.id}:{owner_id}" if owner_id else str(message.channel.id)
+    now = time.monotonic()
+    
+    # Si detecta spam masivo del mismo error, borra silenciosamente
+    if now - INVALID_LOG_LAST_SENT.get(cooldown_key, 0) < INVALID_LOG_COOLDOWN:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    INVALID_LOG_LAST_SENT[cooldown_key] = now
+
+    try:
+        log_channel = client.get_channel(INVALID_LOG_CHANNEL_ID) or await client.fetch_channel(INVALID_LOG_CHANNEL_ID)
+        if not log_channel:
+            return
+
+        mention_line = f"{tagged_user['mention']}\n" if tagged_user and tagged_user.get("mention") else ""
+        allowed = discord.AllowedMentions(users=True)
+
+        content = (
+            f"{mention_line}"
+            f"**Rejected message from channel <#{message.channel.id}>**\n"
+            f"**Reason:** {reason}\n\n"
+            f"**Original message:**\n"
+            f"```{original_text[:1300]}```"
+        )
+
+        await log_channel.send(content=content, allowed_mentions=allowed)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("Error reenviando mensaje inválido: %s", e)
 
 # =========================================================
 # DETECCIÓN Y EXTRACCIÓN EXACTA DE CARTAS (4 Y 5 CARTAS)
@@ -746,52 +820,67 @@ def build_forum_info_embed(
     status: str = "none",
     alive_users: Optional[List[str]] = None,
     dead_users: Optional[List[str]] = None,
+    group: str = "Elite_Four",
+    created_at_ts: Optional[int] = None,
 ) -> discord.Embed:
-    """
-    Panel limpio y directo. Oculta iconos y barras gigantes.
-    Muestra únicamente lo relevante.
-    """
     alive_users = alive_users or []
     dead_users = dead_users or []
+    ts = created_at_ts or int(time.time())
 
     if status == "alive":
         color = 0x2ECC71
-        status_text = "✅ VERIFIED ALIVE"
+        status_badge = "✅ VERIFIED ALIVE"
+        progress_bar = "🟩🟩🟩🟩🟩🟩🟩🟩"
     elif status == "dead":
         color = 0xE74C3C
-        status_text = "💀 CONFIRMED DEAD"
+        status_badge = "💀 CONFIRMED DEAD"
+        progress_bar = "🟥🟥🟥🟥🟥🟥🟥🟥"
     else:
         color = 0xF1C40F
-        status_text = "⏳ WAITING FOR TEST"
+        dead_progress = min(len(dead_users), 4)
+        progress_bar = ("🟧" * (dead_progress * 2)) + ("⬛" * (8 - dead_progress * 2)) if dead_progress else "🟨🟨⬛⬛⬛⬛⬛⬛"
+        status_badge = f"⏳ WAITING FOR TEST ({len(dead_users)}/4 Dead)"
 
     obtainer_mention = meta.get("owner_mention") or meta.get("owner_display_name") or "Unknown"
     nickname = meta.get("bot_name") or "Unknown"
     game_id = meta.get("game_id") or "UnknownID"
+    packs_count = meta.get("packs_count")
+    packs_text = f"{packs_count} Packs" if packs_count is not None else "? Packs"
+    pack_name = meta.get("pack_name") or "DeluxeB"
+    filename = meta.get("filename") or "unknown_file.xml"
+    group_label = GROUP_CONFIG.get(group, {}).get("LABEL", group.replace("_", " "))
 
     embed = discord.Embed(
-        title=f"✨ GOD PACK {pack_label}  |  {status_text}",
+        title=f"✨ {group_label.upper()} — GOD PACK {pack_label}",
+        description=(
+            f"> 📦 **Expansion:** `{pack_name}`  •  🎯 **Pulls:** `{packs_text}`  •  🕒 **Found:** <t:{ts}:R>\n"
+            f"> {progress_bar}  **{status_badge}**"
+        ),
         color=color,
     )
 
-    embed.add_field(name="👤 Found By", value=obtainer_mention, inline=True)
-    embed.add_field(name="🏷️ Nickname", value=f"`{nickname}`", inline=True)
+    embed.add_field(name="👑 Found By", value=f"> {obtainer_mention}", inline=True)
+    embed.add_field(name="🏷️ Nickname", value=f"> `{nickname}`", inline=True)
+    embed.add_field(name="🎴 Pack Slot", value=f"> `{pack_label}`", inline=True)
 
-    # El Friend ID listo para copiar con un solo toque (estilo código)
     embed.add_field(
         name="📲 Friend ID (Tap to Copy)",
         value=f"```\n{game_id}\n```",
         inline=False,
     )
 
-    alive_str = " ".join(f"<@{u}>" for u in alive_users) if alive_users else "-"
-    dead_str = " ".join(f"<@{u}>" for u in dead_users) if dead_users else "-"
-
+    alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "*No votes yet*"
+    dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "*No votes yet*"
     embed.add_field(
-        name="🗳️ Verification Votes",
-        value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}",
+        name="🗳️ Live Community Verification",
+        value=(
+            f"🟢 **Alive ({len(alive_users)}/1):** {alive_str}\n"
+            f"🔴 **Dead ({len(dead_users)}/4):** {dead_str}"
+        ),
         inline=False,
     )
 
+    embed.set_footer(text=f"🔍 Click buttons 1-5 below to inspect each card in HD  •  📄 {filename}")
     return embed
 
 
@@ -928,7 +1017,6 @@ class GPVoteView(discord.ui.View):
         self.vote_key = vote_key
         self.group = group
 
-        # Usamos Custom IDs dinámicos para evitar colisiones entre botones de distintos hilos
         self.btn_alive = discord.ui.Button(
             label="🟢 Alive (0)", 
             style=discord.ButtonStyle.success, 
@@ -983,7 +1071,6 @@ class GPVoteView(discord.ui.View):
         data[self.vote_key] = state
         await save_vote_state(self.group, data)
 
-        # Actualizar etiquetas de los botones dinámicamente
         self.btn_alive.label = f"🟢 Alive ({alive_count})"
         self.btn_dead.label = f"🔴 Dead ({dead_count})"
         
@@ -993,12 +1080,15 @@ class GPVoteView(discord.ui.View):
             await update_gp_thread_status(int(self.vote_key), status)
             await update_main_link_button(state, status, state.get("meta", {}), state.get("pack_label", ""))
 
+        created_ts = int(state.get("created_at", time.time()))
         updated_embed = build_forum_info_embed(
             state.get("meta", {}),
             state.get("pack_label", "[?/5]"),
             status=status,
             alive_users=state["alive_users"],
             dead_users=state["dead_users"],
+            group=self.group,
+            created_at_ts=created_ts,
         )
         await interaction.response.edit_message(embed=updated_embed, view=self)
 
@@ -1053,7 +1143,9 @@ async def on_message(message: discord.Message):
         if message.author.id == client.user.id or message.id in PROCESSED_MESSAGES:
             return
 
-        if message.webhook_id is None or message.channel.id not in CHANNEL_GROUP_MAP:
+        if not is_target_message(message):
+            if message.webhook_id is not None and message.channel.id in CHANNEL_GROUP_MAP:
+                await forward_invalid_message(message, "No God Pack (Faltan desencadenadores).")
             return
 
         image_attachments = [
@@ -1063,6 +1155,7 @@ async def on_message(message: discord.Message):
         ]
 
         if not image_attachments:
+            await forward_invalid_message(message, "El mensaje coincide con el formato de GP, pero no contiene una imagen válida adjunta.")
             return
 
         first_att = image_attachments[0]
@@ -1113,6 +1206,7 @@ async def on_message(message: discord.Message):
 
         post_url = None
         cache_id = str(message.id)
+        now_ts = int(time.time())
 
         if post_data and post_data.get("thread"):
             post_thread = post_data["thread"]
@@ -1125,11 +1219,17 @@ async def on_message(message: discord.Message):
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
 
-            info_embed = build_forum_info_embed(meta, pack_label, status="none")
+            info_embed = build_forum_info_embed(
+                meta,
+                pack_label,
+                status="none",
+                group=group,
+                created_at_ts=now_ts,
+            )
 
             vote_data = await load_vote_state(group)
             vote_data[vote_key] = {
-                "created_at": time.time(),
+                "created_at": now_ts,
                 "group": group,
                 "owner_discord_id": owner_info.get("discord_id"),
                 "friend_id": friend_id,
@@ -1165,6 +1265,30 @@ async def on_message(message: discord.Message):
         main_file = discord.File(io.BytesIO(fan_bytes), filename="gp_fan.png")
         sent_main = await message.channel.send(file=main_file, view=view)
 
+        # Enviar respaldo al canal de logs (GP Register)
+        if LOG_CHANNEL_ID:
+            try:
+                log_channel = client.get_channel(LOG_CHANNEL_ID) or await client.fetch_channel(LOG_CHANNEL_ID)
+                if log_channel:
+                    log_files = []
+                    for att in message.attachments:
+                        if (att.content_type or "").lower().startswith("image/") or att.filename.lower().endswith(VALID_IMAGE_EXTENSIONS):
+                            att_bytes = await att.read()
+                            log_files.append(discord.File(io.BytesIO(att_bytes), filename=att.filename))
+
+                    log_text = (
+                        f"**Registro GP Processed**\n"
+                        f"**Found by:** {owner_info.get('mention', 'Unknown')}\n"
+                        f"**Bot:** `{meta.get('bot_name')} ({friend_id})`\n"
+                        f"**Pack:** `{pack_label}`\n\n"
+                        f"**Mensaje original:**\n```{message.content[:1500]}```"
+                    )
+                    sent_log = await log_channel.send(content=log_text, files=log_files)
+                    asyncio.create_task(delete_message_later(sent_log, 172800))
+            except Exception as e:
+                logger.exception("Error enviando log al registro: %s", e)
+
+        # Borrado del mensaje original
         try:
             await message.delete()
         except Exception:
