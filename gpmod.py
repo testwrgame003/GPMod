@@ -14,14 +14,7 @@ from urllib.parse import quote
 
 import numpy as np
 import discord
-from PIL import Image, ImageDraw, ImageFilter, ImageEnhance, ImageFont
-
-# =========================================================
-# SELECTOR DE MODO VISUAL ("HUD_LINEAR" o "FAN")
-# =========================================================
-# Usa "HUD_LINEAR" para el nuevo marco Cyber-Arcoíris en fila
-# Usa "FAN" para volver al modo Abanico que guardamos antes
-DISPLAY_MODE = "HUD_LINEAR"
+from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
 # =========================================================
 # VARIABLES DE ENTORNO DESDE RAILWAY
@@ -49,17 +42,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("gp_hud_bot")
+logger = logging.getLogger("gp_fan_bot")
 
-# Dimensiones del Modo HUD Lineal (Proporción 16:9 panorámica HD que Discord muestra gigante)
-HUD_CANVAS_W = 1920
-HUD_CANVAS_H = 1040
-
-# Dimensiones del Modo Abanico (Guardado intacto)
+# Dimensiones optimizadas para que Discord muestre el Abanico grande y nítido
 FAN_CANVAS_W = 1480
 FAN_CANVAS_H = 780
-BG_DARK_COLOR = (13, 15, 32)
-BG_GLOW_COLOR = (34, 42, 88)
+BG_DARK_COLOR = (13, 15, 32)       # Azul noche profundo
+BG_GLOW_COLOR = (34, 42, 88)       # Resplandor central sutil
 
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
@@ -72,15 +61,15 @@ INVALID_LOG_COOLDOWN = 10
 INVALID_LOG_LAST_SENT = {}
 
 CHANNEL_GROUP_MAP = {
-    1564890852310913034: "Elite_Four",
+    1497179630027800728: "Elite_Four",
     1497179450960379915: "Trainer",
     1534456693126332568: "Gym_Leader",
 }
 
 GROUP_CONFIG = {
-    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396, "LABEL": "TRAINER"},
-    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483, "LABEL": "GYM LEADER"},
-    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015, "LABEL": "ELITE FOUR"},
+    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
+    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015},
 }
 
 group_locks = defaultdict(asyncio.Lock)
@@ -116,10 +105,15 @@ def extract_axis_bounds(mask_slice: np.ndarray, axis: int, expected_count: int, 
 
 
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
+    """
+    Extrae las 4 o 5 cartas tanto si vienen en formato cuadrícula normal (3+1 / 3+2)
+    como si vienen en formato lineal horizontal.
+    """
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
     arr = np.array(rgb_img, dtype=np.float32)
 
+    # Si la imagen de entrada ya es lineal, dividirla en 4 o 5 partes iguales
     if is_already_linear_gp(rgb_img):
         num_c = 4 if (w / max(h, 1)) < 3.15 else 5
         step = w / num_c
@@ -171,284 +165,11 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 
 
 # =========================================================
-# FUENTES Y UTILIDADES DE ESTILO
-# =========================================================
-
-def load_hud_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-        "arialbd.ttf",
-        "arial.ttf",
-    ]
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target_h: int, radius: int = 18) -> Image.Image:
-    resized = card_img.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
-    sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGBA")
-
-    mask = Image.new("L", (target_w, target_h), 0)
-    draw = ImageDraw.Draw(mask)
-    draw.rounded_rectangle((0, 0, target_w - 1, target_h - 1), radius=radius, fill=255)
-
-    out = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-    out.paste(sharpened, (0, 0), mask)
-    return out
-
-
-# =========================================================
-# MOTOR GRÁFICO 1: NUEVO MODO CYBER-HUD ARCOÍRIS LINEAL
-# =========================================================
-
-def create_rainbow_gradient(width: int, height: int, alpha: int = 255) -> Image.Image:
-    """Genera una textura horizontal de degradado arcoíris suave (Cian -> Violeta -> Rosa -> Dorado -> Esmeralda -> Cian)."""
-    x = np.linspace(0, 1, width, dtype=np.float32)
-    # Fases desplazadas para crear un espectro holográfico vibrante y continuo
-    r = np.clip(128 + 127 * np.sin(2 * np.pi * (x * 1.15 + 0.00)), 30, 255).astype(np.uint8)
-    g = np.clip(128 + 127 * np.sin(2 * np.pi * (x * 1.15 + 0.33)), 40, 255).astype(np.uint8)
-    b = np.clip(128 + 127 * np.sin(2 * np.pi * (x * 1.15 + 0.67)), 60, 255).astype(np.uint8)
-
-    row = np.stack([r, g, b, np.full_like(r, alpha)], axis=1)
-    arr = np.broadcast_to(row[np.newaxis, :, :], (height, width, 4)).copy()
-    return Image.fromarray(arr, mode="RGBA")
-
-
-def build_cyber_rainbow_hud_image(
-    cards: List[Image.Image],
-    meta: Optional[dict] = None,
-    group: str = "Elite_Four",
-    pack_label: str = "[?/5]",
-) -> Image.Image:
-    """
-    Construye el marco Cyber-HUD con acentos arcoíris holográficos, partículas de luz
-    y las 4 o 5 cartas alineadas en fila con aura neón individual.
-    """
-    meta = meta or {}
-    W, H = HUD_CANVAS_W, HUD_CANVAS_H
-    num_cards = len(cards)
-
-    # 1. Fondo espacial profundo + Nebulosa Arcoíris difuminada en el centro
-    base = Image.new("RGBA", (W, H), (8, 10, 22, 255))
-    rainbow_full = create_rainbow_gradient(W, H, alpha=255)
-
-    nebula_mask = Image.new("L", (W, H), 0)
-    n_draw = ImageDraw.Draw(nebula_mask)
-    n_draw.ellipse((int(W * 0.06), int(H * 0.14), int(W * 0.94), int(H * 0.86)), fill=68)
-    nebula_mask = nebula_mask.filter(ImageFilter.GaussianBlur(radius=110))
-    base.paste(rainbow_full, (0, 0), nebula_mask)
-
-    # 2. Cuadrícula tecnológica sutil y partículas de polvo holográfico
-    grid_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    g_draw = ImageDraw.Draw(grid_layer)
-    for gx in range(80, W - 80, 80):
-        g_draw.line([(gx, 130), (gx, H - 130)], fill=(90, 120, 200, 11), width=1)
-    for gy in range(160, H - 120, 80):
-        g_draw.line([(80, gy), (W - 80, gy)], fill=(90, 120, 200, 11), width=1)
-
-    rng = np.random.default_rng(seed=2026)
-    spark_colors = [
-        (0, 245, 255, 150),
-        (255, 70, 220, 150),
-        (255, 215, 60, 150),
-        (80, 255, 170, 150),
-    ]
-    for _ in range(85):
-        px = int(rng.integers(55, W - 55))
-        py = int(rng.integers(125, H - 125))
-        pr = int(rng.integers(1, 4))
-        col = spark_colors[int(rng.integers(0, len(spark_colors)))]
-        g_draw.ellipse((px - pr, py - pr, px + pr, py + pr), fill=col)
-
-    base = Image.alpha_composite(base, grid_layer)
-
-    # 3. Paneles oscuros translúcidos del HUD (Header, Centro y Footer)
-    hud_dark = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    h_draw = ImageDraw.Draw(hud_dark)
-
-    # Marco exterior general
-    h_draw.rounded_rectangle((24, 22, W - 24, H - 22), radius=26, fill=(10, 13, 28, 175))
-
-    # Trapecio central del título superior
-    top_center_poly = [(470, 22), (1450, 22), (1385, 132), (535, 132)]
-    h_draw.polygon(top_center_poly, fill=(14, 18, 38, 240))
-
-    # Placas laterales superiores (Izquierda: Pack Name | Derecha: Pack Ratio)
-    left_badge_poly = [(56, 52), (455, 52), (495, 118), (56, 118)]
-    right_badge_poly = [(1465, 52), (W - 56, 52), (W - 56, 118), (1425, 118)]
-    h_draw.polygon(left_badge_poly, fill=(18, 24, 52, 225))
-    h_draw.polygon(right_badge_poly, fill=(18, 24, 52, 225))
-
-    # Trapecio central inferior (Friend ID)
-    bot_center_poly = [(580, H - 22), (1340, H - 22), (1285, H - 110), (635, H - 110)]
-    h_draw.polygon(bot_center_poly, fill=(14, 18, 38, 240))
-
-    # Placas laterales inferiores (Izquierda: Found By | Derecha: Status Pill)
-    bot_left_poly = [(56, H - 102), (560, H - 102), (595, H - 40), (56, H - 40)]
-    h_draw.polygon(bot_left_poly, fill=(18, 24, 52, 215))
-
-    base = Image.alpha_composite(base, hud_dark)
-
-    # 4. Trazado de Líneas Neón Arcoíris del HUD (con resplandor doble)
-    stroke_mask = Image.new("L", (W, H), 0)
-    s_draw = ImageDraw.Draw(stroke_mask)
-
-    # Borde perimetral y biseles superiores/inferiores
-    s_draw.rounded_rectangle((24, 22, W - 24, H - 22), radius=26, outline=255, width=4)
-    s_draw.line([(470, 22), (535, 132), (1385, 132), (1450, 22)], fill=255, width=5)
-    s_draw.polygon(left_badge_poly, outline=220, width=3)
-    s_draw.polygon(right_badge_poly, outline=220, width=3)
-    s_draw.line([(580, H - 22), (635, H - 110), (1285, H - 110), (1340, H - 22)], fill=255, width=4)
-    s_draw.polygon(bot_left_poly, outline=200, width=2)
-
-    # Barras de acento diagonales estilo Cyber en las 4 esquinas
-    for i in range(4):
-        offset = i * 26
-        # Arriba izquierda
-        s_draw.polygon([(95 + offset, 24), (112 + offset, 24), (98 + offset, 44), (81 + offset, 44)], fill=255)
-        # Arriba derecha
-        s_draw.polygon([(W - 95 - offset, 24), (W - 112 - offset, 24), (W - 98 - offset, 44), (W - 81 - offset, 44)], fill=255)
-        # Abajo centro-izquierda y centro-derecha
-        s_draw.polygon([(505 + offset, H - 24), (520 + offset, H - 24), (508 + offset, H - 40), (493 + offset, H - 40)], fill=255)
-        s_draw.polygon([(W - 505 - offset, H - 24), (W - 520 - offset, H - 24), (W - 508 - offset, H - 40), (W - 493 - offset, H - 40)], fill=255)
-
-    # Soportes de esquina internos (Targeting Brackets) alrededor de la fila de cartas
-    bx1, by1, bx2, by2 = 64, 158, W - 64, H - 138
-    blen = 42
-    # Sup-Izq
-    s_draw.line([(bx1, by1 + blen), (bx1, by1), (bx1 + blen, by1)], fill=210, width=3)
-    # Sup-Der
-    s_draw.line([(bx2 - blen, by1), (bx2, by1), (bx2, by1 + blen)], fill=210, width=3)
-    # Inf-Izq
-    s_draw.line([(bx1, by2 - blen), (bx1, by2), (bx1 + blen, by2)], fill=210, width=3)
-    # Inf-Der
-    s_draw.line([(bx2 - blen, by2), (bx2, by2), (bx2, by2 - blen)], fill=210, width=3)
-
-    # Aplicar resplandor neón (Blur) + línea nítida encima usando el gradiente arcoíris
-    glow_mask = stroke_mask.filter(ImageFilter.GaussianBlur(radius=8))
-    base.paste(rainbow_full, (0, 0), glow_mask)
-    base.paste(rainbow_full, (0, 0), stroke_mask)
-
-    # 5. Renderizar las 4 o 5 cartas en Fila con Aura Arcoíris individual y marco brillante
-    if num_cards == 4:
-        card_w, card_h = 390, 544
-        gap_x = 34
-    else:
-        card_w, card_h = 332, 463
-        gap_x = 24
-
-    total_row_w = (num_cards * card_w) + ((num_cards - 1) * gap_x)
-    start_x = (W - total_row_w) // 2
-    center_y = 515
-    top_y = center_y - (card_h // 2)
-
-    # Colores de aura individual para cada slot (Arcoíris: Rosa -> Dorado -> Verde -> Cian -> Violeta)
-    slot_aura_colors = [
-        (255, 75, 195),   # Slot 1: Magenta / Rosa neón
-        (255, 195, 55),   # Slot 2: Dorado cálido
-        (75, 255, 165),   # Slot 3: Verde esmeralda
-        (0, 225, 255),    # Slot 4: Cian eléctrico
-        (185, 95, 255),   # Slot 5: Violeta / Púrpura
-    ]
-
-    aura_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    a_draw = ImageDraw.Draw(aura_layer)
-
-    styled_cards: List[Tuple[int, int, Image.Image, Tuple[int, int, int]]] = []
-    for idx, card in enumerate(cards):
-        cx1 = start_x + idx * (card_w + gap_x)
-        cy1 = top_y
-        col = slot_aura_colors[idx % len(slot_aura_colors)]
-
-        # Halo luminoso detrás de cada carta
-        a_draw.rounded_rectangle(
-            (cx1 - 10, cy1 - 10, cx1 + card_w + 10, cy1 + card_h + 10),
-            radius=24,
-            fill=(*col, 135),
-        )
-        styled = style_card_with_rounded_corners(card, card_w, card_h, radius=16)
-        styled_cards.append((cx1, cy1, styled, col))
-
-    aura_layer = aura_layer.filter(ImageFilter.GaussianBlur(radius=18))
-    base = Image.alpha_composite(base, aura_layer)
-
-    # Pegar cada carta y su bisel holográfico fino
-    border_draw = ImageDraw.Draw(base)
-    for cx1, cy1, styled, col in styled_cards:
-        base.alpha_composite(styled, (cx1, cy1))
-        border_draw.rounded_rectangle(
-            (cx1 - 2, cy1 - 2, cx1 + card_w + 1, cy1 + card_h + 1),
-            radius=18,
-            outline=(*col, 235),
-            width=3,
-        )
-
-    # 6. Textos del HUD (Header y Footer igual a tu imagen de referencia)
-    text_draw = ImageDraw.Draw(base)
-    font_title = load_hud_font(48, bold=True)
-    font_sub = load_hud_font(26, bold=True)
-    font_id = load_hud_font(29, bold=True)
-
-    group_label = GROUP_CONFIG.get(group, {}).get("LABEL", group.replace("_", " ").upper())
-    title_text = f"{group_label} GOD PACK"
-
-    # Centrar título superior con sombra cian
-    tb = text_draw.textbbox((0, 0), title_text, font=font_title)
-    tx = (W - (tb[2] - tb[0])) // 2
-    ty = 48
-    text_draw.text((tx + 2, ty + 3), title_text, font=font_title, fill=(0, 210, 255, 110))
-    text_draw.text((tx, ty), title_text, font=font_title, fill=(255, 255, 255, 255))
-
-    # Texto superior izquierdo: [XP] PACK NAME
-    packs_count = meta.get("packs_count")
-    packs_str = f"[{packs_count}P]" if packs_count is not None else "[1P]"
-    pack_name_raw = (meta.get("pack_name") or "DELUXE PACK").upper()
-    if "PACK" not in pack_name_raw:
-        pack_name_raw += " PACK"
-    left_top_text = f"{packs_str} {pack_name_raw}"[:24]
-    text_draw.text((82, 69), left_top_text, font=font_sub, fill=(235, 240, 255, 255))
-
-    # Texto superior derecho: 4/5 GOD PACK (o 4/4 DELUXE)
-    clean_ratio = pack_label.strip("[]")
-    right_top_text = f"{clean_ratio}  2-STAR GP"
-    rb = text_draw.textbbox((0, 0), right_top_text, font=font_sub)
-    text_draw.text((W - 82 - (rb[2] - rb[0]), 69), right_top_text, font=font_sub, fill=(255, 225, 110, 255))
-
-    # Texto inferior izquierdo: FOUND BY: USERNAME
-    owner_name = (meta.get("owner_display_name") or meta.get("obtainer_user") or "UNKNOWN").upper()
-    found_text = f"FOUND BY: {owner_name}"[:28]
-    text_draw.text((82, H - 86), found_text, font=font_sub, fill=(240, 245, 255, 255))
-
-    # Texto inferior central: ID: 16 DIGITS
-    game_id = meta.get("game_id") or "0000000000000000"
-    id_text = f"ID: {game_id}"
-    ib = text_draw.textbbox((0, 0), id_text, font=font_id)
-    ix = (W - (ib[2] - ib[0])) // 2
-    text_draw.text((ix, H - 84), id_text, font=font_id, fill=(255, 255, 255, 255))
-
-    # Botón/Insignia inferior derecha: ALIVE (Estilo neón verde)
-    pill_x1, pill_y1, pill_x2, pill_y2 = W - 290, H - 102, W - 64, H - 40
-    border_draw.rounded_rectangle((pill_x1, pill_y1, pill_x2, pill_y2), radius=20, fill=(14, 52, 34, 230), outline=(46, 255, 138, 255), width=3)
-    status_str = "ALIVE"
-    sb = text_draw.textbbox((0, 0), status_str, font=font_id)
-    sx = pill_x1 + ((pill_x2 - pill_x1) - (sb[2] - sb[0])) // 2
-    sy = pill_y1 + ((pill_y2 - pill_y1) - (sb[3] - sb[1])) // 2 - 3
-    text_draw.text((sx, sy), status_str, font=font_id, fill=(110, 255, 175, 255))
-
-    return base.convert("RGB")
-
-
-# =========================================================
-# MOTOR GRÁFICO 2: MODO ABANICO (GUARDADO INTACTO)
+# MOTOR GRÁFICO: MODO ABANICO + INSPECTOR INTERACTIVO (ZOOM)
 # =========================================================
 
 def create_studio_background(width: int, height: int) -> Image.Image:
+    """Crea un fondo oscuro elegante con iluminación radial sutil en el centro."""
     bg = Image.new("RGBA", (width, height), (*BG_DARK_COLOR, 255))
     glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(glow)
@@ -465,6 +186,20 @@ def create_studio_background(width: int, height: int) -> Image.Image:
     return Image.alpha_composite(bg, glow)
 
 
+def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target_h: int, radius: int = 18) -> Image.Image:
+    """Redimensiona la carta con filtro LANCZOS, realza su nitidez y redondea sus esquinas."""
+    resized = card_img.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+    sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGBA")
+
+    mask = Image.new("L", (target_w, target_h), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((0, 0, target_w - 1, target_h - 1), radius=radius, fill=255)
+
+    out = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    out.paste(sharpened, (0, 0), mask)
+    return out
+
+
 def paste_rotated_card_with_shadow(
     canvas: Image.Image,
     styled_card: Image.Image,
@@ -474,11 +209,13 @@ def paste_rotated_card_with_shadow(
     shadow_blur: int = 16,
     shadow_opacity: int = 175
 ) -> None:
+    """Rota una carta con interpolación BICUBIC y proyecta una sombra paralela 3D."""
     pad = 45
     w, h = styled_card.size
     padded_card = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
     padded_card.paste(styled_card, (pad, pad))
 
+    # Crear silueta negra para la sombra a partir del canal alfa
     alpha = padded_card.split()[3]
     shadow_alpha = alpha.point(lambda p: int(p * (shadow_opacity / 255.0)))
     shadow_img = Image.new("RGBA", padded_card.size, (0, 0, 0, 0))
@@ -498,6 +235,9 @@ def paste_rotated_card_with_shadow(
 
 
 def build_fan_image(cards: List[Image.Image]) -> Image.Image:
+    """
+    Construye el abanico de 4 o 5 cartas con superposición orgánica, arco curvo y sombras 3D.
+    """
     num_cards = len(cards)
     canvas = create_studio_background(FAN_CANVAS_W, FAN_CANVAS_H)
 
@@ -524,33 +264,30 @@ def build_fan_image(cards: List[Image.Image]) -> Image.Image:
     return canvas.convert("RGB")
 
 
-# =========================================================
-# INSPECTOR INTERACTIVO DE CARTAS (ZOOM IN-GAME)
-# =========================================================
-
 def build_inspected_card_image(cards: List[Image.Image], selected_index: int) -> bytes:
     """
-    Muestra la carta seleccionada gigante en el centro con el diseño actual desenfocado detrás.
+    Recrea el efecto del juego cuando mantienes presionada una carta:
+    El abanico completo queda de fondo oscurecido y desenfocado, y la carta seleccionada
+    se muestra en el centro a tamaño gigante, recta y con resplandor alrededor.
     """
-    if DISPLAY_MODE == "HUD_LINEAR":
-        bg_base = build_cyber_rainbow_hud_image(cards).resize((FAN_CANVAS_W, FAN_CANVAS_H), Image.Resampling.LANCZOS).convert("RGBA")
-    else:
-        bg_base = build_fan_image(cards).convert("RGBA")
-
-    darkened = ImageEnhance.Brightness(bg_base).enhance(0.30)
+    fan_base = build_fan_image(cards).convert("RGBA")
+    # Oscurecer y desenfocar el fondo
+    darkened = ImageEnhance.Brightness(fan_base).enhance(0.32)
     blurred_bg = darkened.filter(ImageFilter.GaussianBlur(radius=10))
 
+    # Escalar la carta seleccionada a tamaño gigante en el centro
     target_h = 710
-    target_w = int(round(target_h * (365.5 / 510.0)))
+    target_w = int(round(target_h * (365.5 / 510.0)))  # ~509 px
     selected_card = cards[selected_index]
     styled_giant = style_card_with_rounded_corners(selected_card, target_w, target_h, radius=22)
 
+    # Añadir resplandor dorado/blanco detrás de la carta gigante
     cx, cy = FAN_CANVAS_W // 2, FAN_CANVAS_H // 2
     glow_layer = Image.new("RGBA", (FAN_CANVAS_W, FAN_CANVAS_H), (0, 0, 0, 0))
     g_draw = ImageDraw.Draw(glow_layer)
-    gx1, gy1 = cx - target_w // 2 - 14, cy - target_h // 2 - 14
-    gx2, gy2 = cx + target_w // 2 + 14, cy + target_h // 2 + 14
-    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(0, 235, 255, 130))
+    gx1, gy1 = cx - target_w // 2 - 12, cy - target_h // 2 - 12
+    gx2, gy2 = cx + target_w // 2 + 12, cy + target_h // 2 + 12
+    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(255, 225, 130, 120))
     glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
 
     blurred_bg = Image.alpha_composite(blurred_bg, glow_layer)
@@ -569,33 +306,14 @@ def build_inspected_card_image(cards: List[Image.Image], selected_index: int) ->
     return out_buf.getvalue()
 
 
-def render_gp_showcase_bytes(
-    source_img: Image.Image,
-    meta: dict,
-    group: str,
-    pack_label: str,
-) -> Tuple[bytes, List[Image.Image]]:
-    """
-    Genera los bytes PNG finales según DISPLAY_MODE ("HUD_LINEAR" o "FAN")
-    y devuelve también la lista de cartas recortadas para el caché del Zoom.
-    """
-    cards = detect_and_extract_cards(source_img)
-    if DISPLAY_MODE == "HUD_LINEAR":
-        final_img = build_cyber_rainbow_hud_image(cards, meta=meta, group=group, pack_label=pack_label)
-    else:
-        final_img = build_fan_image(cards)
-
-    out_buf = io.BytesIO()
-    final_img.save(out_buf, format="PNG", optimize=True)
-    return out_buf.getvalue(), cards
-
-
 def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
+    """Guarda las cartas individuales en disco por 72h para que los botones de zoom respondan al instante."""
     folder = CARDS_CACHE_DIR / str(cache_id)
     folder.mkdir(parents=True, exist_ok=True)
     for i, c in enumerate(cards):
         c.save(folder / f"card_{i}.png", format="PNG")
 
+    # Limpiar cachés viejos (>72h)
     now = time.time()
     for sub in CARDS_CACHE_DIR.iterdir():
         if sub.is_dir() and (now - sub.stat().st_mtime) > (72 * 3600):
@@ -612,6 +330,14 @@ def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
     if not files:
         return None
     return [Image.open(f).convert("RGB") for f in files]
+
+
+def convert_gp_to_fan_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
+    cards = detect_and_extract_cards(source_img)
+    fan_img = build_fan_image(cards)
+    out_buf = io.BytesIO()
+    fan_img.save(out_buf, format="PNG", optimize=True)
+    return out_buf.getvalue(), cards
 
 
 # =========================================================
@@ -1068,7 +794,7 @@ async def create_forum_post_with_image_bytes(
     group: str,
     title: str,
     image_bytes: bytes,
-    filename: str = "gp_hud.png",
+    filename: str = "gp_fan.png",
 ) -> Optional[dict]:
     try:
         forum_id = GROUP_CONFIG[group]["FORUM_CHANNEL_ID"]
@@ -1085,6 +811,7 @@ async def create_forum_post_with_image_bytes(
 
 
 class CardZoomButton(discord.ui.Button):
+    """Botón interactivo para hacer zoom sobre una carta específica del abanico como en el juego."""
     def __init__(self, cache_id: str, card_index: int):
         super().__init__(
             label=f"{card_index + 1}",
@@ -1108,6 +835,7 @@ class CardZoomButton(discord.ui.Button):
         zoomed_bytes = await asyncio.to_thread(build_inspected_card_image, cards, self.card_index)
         file = discord.File(io.BytesIO(zoomed_bytes), filename=f"card_{self.card_index + 1}_zoom.png")
 
+        # Permitir cambiar de carta directamente desde la ventana de zoom
         switch_view = discord.ui.View(timeout=180)
         for idx in range(len(cards)):
             btn = CardZoomButton(self.cache_id, idx)
@@ -1300,7 +1028,7 @@ async def restore_persistent_views():
 
 @client.event
 async def on_ready():
-    logger.info("✅ Bot GP (%s) conectado como %s", DISPLAY_MODE, client.user)
+    logger.info("✅ Bot GP Abanico Interactivo conectado como %s", client.user)
     await restore_persistent_views()
 
 
@@ -1331,7 +1059,13 @@ async def on_message(message: discord.Message):
             PROCESSED_MESSAGES.clear()
 
         group = CHANNEL_GROUP_MAP[message.channel.id]
+
+        # Generar la imagen en modo Abanico y obtener las cartas individuales para el Zoom
+        fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
+        num_cards = len(extracted_cards)
+
         meta = parse_heartbeat_metadata(message.content or "")
+        pack_label = build_pack_label_from_meta(meta)
 
         await cleanup_expired_vips(group)
 
@@ -1346,20 +1080,6 @@ async def on_message(message: discord.Message):
         meta["owner_discord_id"] = owner_info.get("discord_id")
         meta["owner_display_name"] = owner_info.get("display_name")
         meta["owner_mention"] = owner_info.get("mention")
-        if friend_id and not meta.get("game_id"):
-            meta["game_id"] = friend_id
-
-        pack_label = build_pack_label_from_meta(meta)
-
-        # Generar la imagen según DISPLAY_MODE ("HUD_LINEAR" o "FAN") con los metadatos del usuario
-        showcase_bytes, extracted_cards = await asyncio.to_thread(
-            render_gp_showcase_bytes,
-            source_img,
-            meta,
-            group,
-            pack_label,
-        )
-        num_cards = len(extracted_cards)
 
         if friend_id:
             await add_vip_id(friend_id, group)
@@ -1371,8 +1091,8 @@ async def on_message(message: discord.Message):
             client,
             group,
             post_title,
-            showcase_bytes,
-            filename="gp_showcase.png",
+            fan_bytes,
+            filename="gp_fan.png",
         )
 
         post_url = None
@@ -1384,6 +1104,7 @@ async def on_message(message: discord.Message):
             vote_key = str(post_thread.id)
             cache_id = vote_key
 
+            # Guardar las cartas en caché asociadas al ID del post para el zoom interactivo
             await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
@@ -1421,14 +1142,16 @@ async def on_message(message: discord.Message):
         else:
             await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
+        # Enviar imagen en modo Abanico al canal principal con botón de enlace + botones de Zoom
         view = (
             ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
             if post_url
             else None
         )
-        main_file = discord.File(io.BytesIO(showcase_bytes), filename="gp_showcase.png")
+        main_file = discord.File(io.BytesIO(fan_bytes), filename="gp_fan.png")
         sent_main = await message.channel.send(file=main_file, view=view)
 
+        # Borrar el mensaje original del webhook inmediatamente
         try:
             await message.delete()
         except Exception:
