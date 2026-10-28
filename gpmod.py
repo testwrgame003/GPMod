@@ -82,70 +82,106 @@ def is_already_linear_gp(img: Image.Image) -> bool:
         return False
     return (w / h) >= 2.1
 
-def trim_card_borders(card_img: Image.Image, bg_rgb: np.ndarray, tolerance: float = 28.0) -> Image.Image:
-    """Limpia el borde residual del fondo oscuro alrededor de una carta recortada."""
-    arr = np.array(card_img.convert("RGB"), dtype=np.float32)
-    diff = np.linalg.norm(arr - bg_rgb, axis=2)
-    mask = diff > tolerance
 
-    # Reducido al 15% para que detecte mejor los bordes muy oscuros de algunas cartas
-    row_has_card = mask.mean(axis=1) > 0.15
-    col_has_card = mask.mean(axis=0) > 0.15
 
-    if not np.any(row_has_card) or not np.any(col_has_card):
-        return card_img
 
-    y_indices = np.where(row_has_card)[0]
-    x_indices = np.where(col_has_card)[0]
-    y1, y2 = int(y_indices[0]), int(y_indices[-1]) + 1
-    x1, x2 = int(x_indices[0]), int(x_indices[-1]) + 1
+def find_segments_1d(proj: np.ndarray, threshold: float = 0.12, min_len: int = 40) -> List[Tuple[int, int]]:
+    """
+    Encuentra los intervalos exactos (inicio, fin) donde hay cartas a partir de un perfil 1D,
+    ignorando el fondo oscuro sin cortar jamás el interior de una carta.
+    """
+    active = proj > threshold
+    padded = np.concatenate(([False], active, [False]))
+    starts = np.where(padded[1:] & ~padded[:-1])[0]
+    ends = np.where(~padded[1:] & padded[:-1])[0]
+    return [(int(s), int(e)) for s, e in zip(starts, ends) if (e - s) >= min_len]
 
-    h, w = arr.shape[:2]
-    if (x2 - x1) >= w * 0.75 and (y2 - y1) >= h * 0.75:
-        return card_img.crop((x1, y1, x2, y2))
-    return card_img
+
+def extract_axis_bounds(mask_slice: np.ndarray, axis: int, expected_count: int, fallback_rel: List[Tuple[float, float]]) -> List[Tuple[int, int]]:
+    """
+    Obtiene los bordes exactos de cada carta en una fila o columna.
+    Si por algún motivo no coincide el conteo, usa las coordenadas exactas medidas al píxel.
+    """
+    length = mask_slice.shape[1 - axis]
+    proj = mask_slice.mean(axis=axis)
+
+    for thresh in (0.12, 0.18, 0.08, 0.25):
+        segs = find_segments_1d(proj, threshold=thresh, min_len=int(length * 0.18))
+        if len(segs) == expected_count:
+            return segs
+
+    return [(int(round(a * length)), int(round(b * length))) for a, b in fallback_rel]
 
 
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
+    """
+    Detecta con precisión de píxel las 4 o 5 cartas separando primero las filas por el canal
+    oscuro central para que nunca se mezclen píxeles de arriba con los de abajo.
+    """
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
     arr = np.array(rgb_img, dtype=np.float32)
 
+    # 1. Muestrear el color exacto del fondo oscuro en las esquinas inferiores vacías
     corner_samples = np.concatenate([
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.01):int(w * 0.10)].reshape(-1, 3),
         arr[int(h * 0.85):int(h * 0.98), int(w * 0.90):int(w * 0.99)].reshape(-1, 3),
     ], axis=0)
     bg_rgb = np.median(corner_samples, axis=0)
 
-    # Coordenadas ampliadas más hacia abajo (y2) para asegurar que tome la carta completa antes de aplicar el trim
-    top_y1, top_y2 = 0.035, 0.510
-    bot_y1, bot_y2 = 0.495, 0.980
+    # 2. Mapa binario: True donde hay carta, False donde es fondo oscuro
+    diff = np.linalg.norm(arr - bg_rgb, axis=2)
+    mask = diff > 22.0
 
-    top_x_boxes = [
-        (0.015, 0.320),
-        (0.345, 0.655),
-        (0.675, 0.985),
-    ]
+    # 3. Encontrar la línea divisoria horizontal exacta entre la fila de arriba y la de abajo
+    mid_top = int(h * 0.46)
+    mid_bot = int(h * 0.54)
+    row_profile = mask[mid_top:mid_bot, :].mean(axis=1)
+    split_y = mid_top + int(np.argmin(row_profile))
 
-    left_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.18):int(w * 0.30)]
-    right_outer_region = arr[int(h * 0.55):int(h * 0.90), int(w * 0.70):int(w * 0.82)]
-    left_diff = float(np.mean(np.linalg.norm(left_outer_region - bg_rgb, axis=2)))
-    right_diff = float(np.mean(np.linalg.norm(right_outer_region - bg_rgb, axis=2)))
+    # 4. Encontrar límites verticales exactos (Y) de la fila superior y de la fila inferior
+    top_y_segs = find_segments_1d(mask[:split_y, :].mean(axis=1), threshold=0.10, min_len=int(h * 0.25))
+    top_y1, top_y2 = top_y_segs[0] if top_y_segs else (int(round(0.043 * h)), int(round(0.493 * h)))
 
-    is_five_cards = (left_diff > 25.0 and right_diff > 25.0)
-    if is_five_cards:
-        bot_x_boxes = [(0.180, 0.485), (0.510, 0.815)]
+    bot_y_segs = find_segments_1d(mask[split_y:, :].mean(axis=1), threshold=0.10, min_len=int(h * 0.25))
+    if bot_y_segs:
+        bot_y1 = split_y + bot_y_segs[0][0]
+        bot_y2 = split_y + bot_y_segs[0][1]
     else:
-        bot_x_boxes = [(0.345, 0.655)]
+        bot_y1, bot_y2 = int(round(0.504 * h)), int(round(0.954 * h))
 
+    # 5. Encontrar límites horizontales exactos (X) de las 3 cartas de arriba
+    fallback_top_x = [
+        (0.0078, 0.3310),
+        (0.3388, 0.6612),
+        (0.6690, 0.9922),
+    ]
+    top_x_bounds = extract_axis_bounds(mask[top_y1:top_y2, :], axis=0, expected_count=3, fallback_rel=fallback_top_x)
+
+    # 6. Detectar si abajo hay 1 carta (Deluxe 4 cartas) o 2 cartas (Estándar 5 cartas)
+    left_outer_check = mask[bot_y1:bot_y2, int(w * 0.18):int(w * 0.30)].mean()
+    right_outer_check = mask[bot_y1:bot_y2, int(w * 0.70):int(w * 0.82)].mean()
+    is_five_cards = (left_outer_check > 0.25 and right_outer_check > 0.25)
+
+    if is_five_cards:
+        fallback_bot_x = [
+            (0.1728, 0.4961),
+            (0.5039, 0.8272),
+        ]
+        bot_x_bounds = extract_axis_bounds(mask[bot_y1:bot_y2, :], axis=0, expected_count=2, fallback_rel=fallback_bot_x)
+    else:
+        fallback_bot_x = [
+            (0.3388, 0.6612),
+        ]
+        bot_x_bounds = extract_axis_bounds(mask[bot_y1:bot_y2, :], axis=0, expected_count=1, fallback_rel=fallback_bot_x)
+
+    # 7. Recortar cada carta limpia y completa
     cards: List[Image.Image] = []
-    for x1_rel, x2_rel in top_x_boxes:
-        box = (int(round(x1_rel * w)), int(round(top_y1 * h)), int(round(x2_rel * w)), int(round(top_y2 * h)))
-        cards.append(trim_card_borders(rgb_img.crop(box), bg_rgb))
+    for x1, x2 in top_x_bounds:
+        cards.append(rgb_img.crop((x1, top_y1, x2, top_y2)))
 
-    for x1_rel, x2_rel in bot_x_boxes:
-        box = (int(round(x1_rel * w)), int(round(bot_y1 * h)), int(round(x2_rel * w)), int(round(bot_y2 * h)))
-        cards.append(trim_card_borders(rgb_img.crop(box), bg_rgb))
+    for x1, x2 in bot_x_bounds:
+        cards.append(rgb_img.crop((x1, bot_y1, x2, bot_y2)))
 
     return cards
 
