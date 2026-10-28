@@ -17,6 +17,13 @@ import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
 # =========================================================
+# CONFIGURACIÓN VISUAL DEL ABANICO
+# =========================================================
+# True  -> El abanico se genera con fondo 100% transparente (PNG RGBA)
+# False -> El abanico se genera con el fondo oscuro e iluminación radial
+TRANSPARENT_BACKGROUND = True
+
+# =========================================================
 # VARIABLES DE ENTORNO DESDE RAILWAY
 # =========================================================
 
@@ -44,11 +51,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gp_fan_bot")
 
-# Dimensiones optimizadas para que Discord muestre el Abanico grande y nítido
 FAN_CANVAS_W = 1480
 FAN_CANVAS_H = 780
-BG_DARK_COLOR = (13, 15, 32)       # Azul noche profundo
-BG_GLOW_COLOR = (34, 42, 88)       # Resplandor central sutil
+BG_DARK_COLOR = (13, 15, 32)
+BG_GLOW_COLOR = (34, 42, 88)
 
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
@@ -67,9 +73,9 @@ CHANNEL_GROUP_MAP = {
 }
 
 GROUP_CONFIG = {
-    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396},
-    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483},
-    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015},
+    "Trainer": {"FORUM_CHANNEL_ID": 1497177430828384396, "LABEL": "Trainer"},
+    "Gym_Leader": {"FORUM_CHANNEL_ID": 1501347022773686483, "LABEL": "Gym Leader"},
+    "Elite_Four": {"FORUM_CHANNEL_ID": 1564934929048019015, "LABEL": "Elite Four"},
 }
 
 group_locks = defaultdict(asyncio.Lock)
@@ -105,15 +111,10 @@ def extract_axis_bounds(mask_slice: np.ndarray, axis: int, expected_count: int, 
 
 
 def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
-    """
-    Extrae las 4 o 5 cartas tanto si vienen en formato cuadrícula normal (3+1 / 3+2)
-    como si vienen en formato lineal horizontal.
-    """
     rgb_img = source_img.convert("RGB")
     w, h = rgb_img.size
     arr = np.array(rgb_img, dtype=np.float32)
 
-    # Si la imagen de entrada ya es lineal, dividirla en 4 o 5 partes iguales
     if is_already_linear_gp(rgb_img):
         num_c = 4 if (w / max(h, 1)) < 3.15 else 5
         step = w / num_c
@@ -165,11 +166,17 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 
 
 # =========================================================
-# MOTOR GRÁFICO: MODO ABANICO + INSPECTOR INTERACTIVO (ZOOM)
+# MOTOR GRÁFICO: MODO ABANICO (TRANSPARENTE O CON FONDO) + ZOOM
 # =========================================================
 
-def create_studio_background(width: int, height: int) -> Image.Image:
-    """Crea un fondo oscuro elegante con iluminación radial sutil en el centro."""
+def create_fan_canvas(width: int, height: int, transparent: bool = True) -> Image.Image:
+    """
+    Si transparent=True, devuelve un lienzo RGBA 100% transparente.
+    Si transparent=False, crea el fondo azul noche con iluminación radial.
+    """
+    if transparent:
+        return Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
     bg = Image.new("RGBA", (width, height), (*BG_DARK_COLOR, 255))
     glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(glow)
@@ -187,7 +194,6 @@ def create_studio_background(width: int, height: int) -> Image.Image:
 
 
 def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target_h: int, radius: int = 18) -> Image.Image:
-    """Redimensiona la carta con filtro LANCZOS, realza su nitidez y redondea sus esquinas."""
     resized = card_img.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
     sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGBA")
 
@@ -209,13 +215,11 @@ def paste_rotated_card_with_shadow(
     shadow_blur: int = 16,
     shadow_opacity: int = 175
 ) -> None:
-    """Rota una carta con interpolación BICUBIC y proyecta una sombra paralela 3D."""
     pad = 45
     w, h = styled_card.size
     padded_card = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
     padded_card.paste(styled_card, (pad, pad))
 
-    # Crear silueta negra para la sombra a partir del canal alfa
     alpha = padded_card.split()[3]
     shadow_alpha = alpha.point(lambda p: int(p * (shadow_opacity / 255.0)))
     shadow_img = Image.new("RGBA", padded_card.size, (0, 0, 0, 0))
@@ -234,12 +238,14 @@ def paste_rotated_card_with_shadow(
     canvas.alpha_composite(rot_card, (top_left_x, top_left_y))
 
 
-def build_fan_image(cards: List[Image.Image]) -> Image.Image:
+def build_fan_image(cards: List[Image.Image], transparent: Optional[bool] = None) -> Image.Image:
     """
-    Construye el abanico de 4 o 5 cartas con superposición orgánica, arco curvo y sombras 3D.
+    Construye el abanico de 4 o 5 cartas. Respeta TRANSPARENT_BACKGROUND para dejar
+    el fondo transparente (RGBA) o sólido (RGB).
     """
+    use_transparent = TRANSPARENT_BACKGROUND if transparent is None else transparent
     num_cards = len(cards)
-    canvas = create_studio_background(FAN_CANVAS_W, FAN_CANVAS_H)
+    canvas = create_fan_canvas(FAN_CANVAS_W, FAN_CANVAS_H, transparent=use_transparent)
 
     if num_cards == 4:
         card_w, card_h = 435, 608
@@ -261,33 +267,38 @@ def build_fan_image(cards: List[Image.Image]) -> Image.Image:
         cy = base_y + (y_offsets[idx] if idx < len(y_offsets) else 0)
         paste_rotated_card_with_shadow(canvas, styled, angle, (cx, cy))
 
-    return canvas.convert("RGB")
+    return canvas if use_transparent else canvas.convert("RGB")
 
 
 def build_inspected_card_image(cards: List[Image.Image], selected_index: int) -> bytes:
     """
-    Recrea el efecto del juego cuando mantienes presionada una carta:
-    El abanico completo queda de fondo oscurecido y desenfocado, y la carta seleccionada
-    se muestra en el centro a tamaño gigante, recta y con resplandor alrededor.
+    Recrea el efecto del juego al mantener presionada una carta:
+    Si TRANSPARENT_BACKGROUND está activo, atenúa y desenfoca el abanico manteniendo
+    el fondo transparente para que la carta seleccionada resalte en el centro.
     """
-    fan_base = build_fan_image(cards).convert("RGBA")
-    # Oscurecer y desenfocar el fondo
-    darkened = ImageEnhance.Brightness(fan_base).enhance(0.32)
-    blurred_bg = darkened.filter(ImageFilter.GaussianBlur(radius=10))
+    fan_base = build_fan_image(cards, transparent=TRANSPARENT_BACKGROUND).convert("RGBA")
 
-    # Escalar la carta seleccionada a tamaño gigante en el centro
+    # Oscurecer únicamente los canales RGB del abanico de fondo sin perder su transparencia
+    r, g, b, a = fan_base.split()
+    rgb_dark = ImageEnhance.Brightness(Image.merge("RGB", (r, g, b))).enhance(0.35)
+    dr, dg, db = rgb_dark.split()
+    if TRANSPARENT_BACKGROUND:
+        # Reducir opacidad del abanico trasero para darle foco total a la carta central
+        a = a.point(lambda p: int(p * 0.55))
+    dimmed_fan = Image.merge("RGBA", (dr, dg, db, a))
+    blurred_bg = dimmed_fan.filter(ImageFilter.GaussianBlur(radius=10))
+
     target_h = 710
-    target_w = int(round(target_h * (365.5 / 510.0)))  # ~509 px
+    target_w = int(round(target_h * (365.5 / 510.0)))
     selected_card = cards[selected_index]
     styled_giant = style_card_with_rounded_corners(selected_card, target_w, target_h, radius=22)
 
-    # Añadir resplandor dorado/blanco detrás de la carta gigante
     cx, cy = FAN_CANVAS_W // 2, FAN_CANVAS_H // 2
     glow_layer = Image.new("RGBA", (FAN_CANVAS_W, FAN_CANVAS_H), (0, 0, 0, 0))
     g_draw = ImageDraw.Draw(glow_layer)
     gx1, gy1 = cx - target_w // 2 - 12, cy - target_h // 2 - 12
     gx2, gy2 = cx + target_w // 2 + 12, cy + target_h // 2 + 12
-    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(255, 225, 130, 120))
+    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(255, 225, 130, 125))
     glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
 
     blurred_bg = Image.alpha_composite(blurred_bg, glow_layer)
@@ -302,18 +313,17 @@ def build_inspected_card_image(cards: List[Image.Image], selected_index: int) ->
     )
 
     out_buf = io.BytesIO()
-    blurred_bg.convert("RGB").save(out_buf, format="PNG", optimize=True)
+    final_zoom = blurred_bg if TRANSPARENT_BACKGROUND else blurred_bg.convert("RGB")
+    final_zoom.save(out_buf, format="PNG", optimize=True)
     return out_buf.getvalue()
 
 
 def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
-    """Guarda las cartas individuales en disco por 72h para que los botones de zoom respondan al instante."""
     folder = CARDS_CACHE_DIR / str(cache_id)
     folder.mkdir(parents=True, exist_ok=True)
     for i, c in enumerate(cards):
         c.save(folder / f"card_{i}.png", format="PNG")
 
-    # Limpiar cachés viejos (>72h)
     now = time.time()
     for sub in CARDS_CACHE_DIR.iterdir():
         if sub.is_dir() and (now - sub.stat().st_mtime) > (72 * 3600):
@@ -334,7 +344,7 @@ def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
 
 def convert_gp_to_fan_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
     cards = detect_and_extract_cards(source_img)
-    fan_img = build_fan_image(cards)
+    fan_img = build_fan_image(cards, transparent=TRANSPARENT_BACKGROUND)
     out_buf = io.BytesIO()
     fan_img.save(out_buf, format="PNG", optimize=True)
     return out_buf.getvalue(), cards
@@ -734,7 +744,7 @@ async def increment_gp_callback(stats: dict) -> dict:
 
 
 # =========================================================
-# DISEÑO VISUAL DEL POST DEL FORO + BOTONES DE ZOOM E HILO
+# PANEL EMBED REDISEÑADO PARA EL FORO + BOTONES DE ZOOM E HILO
 # =========================================================
 
 def build_post_title(meta: dict, pack_label: str) -> str:
@@ -751,41 +761,86 @@ def build_forum_info_embed(
     status: str = "none",
     alive_users: Optional[List[str]] = None,
     dead_users: Optional[List[str]] = None,
+    group: str = "Elite_Four",
+    created_at_ts: Optional[int] = None,
 ) -> discord.Embed:
+    """
+    Panel visual mejorado para el post del foro:
+    - Cambia 'Instance' por '🏷️ Nickname'
+    - Incluye barra visual de estado y tiempo relativo en vivo
+    - Bloque limpio de 1 toque para copiar el Friend ID
+    """
     alive_users = alive_users or []
     dead_users = dead_users or []
+    ts = created_at_ts or int(time.time())
 
     if status == "alive":
-        color, status_badge = 0x2ECC71, "🟢 ALIVE (Verified)"
+        color = 0x2ECC71  # Esmeralda brillante
+        status_badge = "✅ VERIFIED ALIVE"
+        progress_bar = "🟩🟩🟩🟩🟩🟩🟩🟩"
     elif status == "dead":
-        color, status_badge = 0xE74C3C, "🔴 DEAD (Expired)"
+        color = 0xE74C3C  # Rojo carmesí
+        status_badge = "💀 CONFIRMED DEAD"
+        progress_bar = "🟥🟥🟥🟥🟥🟥🟥🟥"
     else:
-        color, status_badge = 0xF1C40F, "⏳ PENDING TEST"
+        color = 0xF1C40F  # Dorado ámbar
+        dead_progress = min(len(dead_users), 4)
+        progress_bar = ("🟧" * (dead_progress * 2)) + ("⬛" * (8 - dead_progress * 2)) if dead_progress else "🟨🟨⬛⬛⬛⬛⬛⬛"
+        status_badge = f"⏳ WAITING FOR TEST ({len(dead_users)}/4 Dead)"
 
     obtainer_mention = meta.get("owner_mention") or meta.get("owner_display_name") or "Unknown"
-    bot_name = meta.get("bot_name") or "UnknownBot"
+    nickname = meta.get("bot_name") or "Unknown"
     game_id = meta.get("game_id") or "UnknownID"
     packs_count = meta.get("packs_count")
-    packs_text = f"{packs_count}P" if packs_count is not None else "?P"
+    packs_text = f"{packs_count} Packs" if packs_count is not None else "? Packs"
     pack_name = meta.get("pack_name") or "DeluxeB"
     filename = meta.get("filename") or "unknown_file.xml"
+    group_label = GROUP_CONFIG.get(group, {}).get("LABEL", group.replace("_", " "))
 
-    embed = discord.Embed(title=f"✨ GOD PACK {pack_label} [{packs_text}] — {pack_name}", color=color)
-    embed.add_field(name="👤 Found By", value=f"{obtainer_mention}", inline=True)
-    embed.add_field(name="🤖 Instance", value=f"`{bot_name}`", inline=True)
-    embed.add_field(name="📡 Status", value=f"**{status_badge}**", inline=True)
-    embed.add_field(name="🆔 Friend ID (Tap to Copy)", value=f"```\n{game_id}\n```", inline=False)
+    embed = discord.Embed(
+        title=f"✨ {group_label.upper()} — GOD PACK {pack_label}",
+        description=(
+            f"> 📦 **Expansion:** `{pack_name}`  •  🎯 **Pulls:** `{packs_text}`  •  🕒 **Found:** <t:{ts}:R>\n"
+            f"> {progress_bar}  **{status_badge}**"
+        ),
+        color=color,
+    )
 
-    if alive_users or dead_users:
-        alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "None"
-        dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "None"
-        embed.add_field(
-            name="🗳️ Community Votes",
-            value=f"🟢 **Alive ({len(alive_users)}):** {alive_str}\n🔴 **Dead ({len(dead_users)}):** {dead_str}",
-            inline=False,
-        )
+    embed.add_field(
+        name="👑 Found By",
+        value=f"> {obtainer_mention}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏷️ Nickname",
+        value=f"> `{nickname}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="🎴 Pack Slot",
+        value=f"> `{pack_label}`",
+        inline=True,
+    )
 
-    embed.set_footer(text=f"💡 Tip: Click 🔍 1-5 below to inspect any card in full HD | File: {filename}")
+    # Bloque dedicado exclusivamente a los 16 dígitos para copiar con 1 toque en móvil y PC
+    embed.add_field(
+        name="📲 Friend ID (Tap to Copy)",
+        value=f"```\n{game_id}\n```",
+        inline=False,
+    )
+
+    alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "*No votes yet*"
+    dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "*No votes yet*"
+    embed.add_field(
+        name="🗳️ Live Community Verification",
+        value=(
+            f"🟢 **Alive ({len(alive_users)}/1):** {alive_str}\n"
+            f"🔴 **Dead ({len(dead_users)}/4):** {dead_str}"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text=f"🔍 Click buttons 1-5 below to inspect each card in HD  •  📄 {filename}")
     return embed
 
 
@@ -811,7 +866,6 @@ async def create_forum_post_with_image_bytes(
 
 
 class CardZoomButton(discord.ui.Button):
-    """Botón interactivo para hacer zoom sobre una carta específica del abanico como en el juego."""
     def __init__(self, cache_id: str, card_index: int):
         super().__init__(
             label=f"{card_index + 1}",
@@ -835,7 +889,6 @@ class CardZoomButton(discord.ui.Button):
         zoomed_bytes = await asyncio.to_thread(build_inspected_card_image, cards, self.card_index)
         file = discord.File(io.BytesIO(zoomed_bytes), filename=f"card_{self.card_index + 1}_zoom.png")
 
-        # Permitir cambiar de carta directamente desde la ventana de zoom
         switch_view = discord.ui.View(timeout=180)
         for idx in range(len(cards)):
             btn = CardZoomButton(self.cache_id, idx)
@@ -976,12 +1029,15 @@ class GPVoteView(discord.ui.View):
             await update_gp_thread_status(int(self.vote_key), status)
             await update_main_link_button(state, status, state.get("meta", {}), state.get("pack_label", ""))
 
+        created_ts = int(state.get("created_at", time.time()))
         updated_embed = build_forum_info_embed(
             state.get("meta", {}),
             state.get("pack_label", "[?/5]"),
             status=status,
             alive_users=state["alive_users"],
             dead_users=state["dead_users"],
+            group=self.group,
+            created_at_ts=created_ts,
         )
         await interaction.response.edit_message(embed=updated_embed, view=self)
 
@@ -1028,7 +1084,7 @@ async def restore_persistent_views():
 
 @client.event
 async def on_ready():
-    logger.info("✅ Bot GP Abanico Interactivo conectado como %s", client.user)
+    logger.info("✅ Bot GP Abanico (Transparent=%s) conectado como %s", TRANSPARENT_BACKGROUND, client.user)
     await restore_persistent_views()
 
 
@@ -1060,7 +1116,6 @@ async def on_message(message: discord.Message):
 
         group = CHANNEL_GROUP_MAP[message.channel.id]
 
-        # Generar la imagen en modo Abanico y obtener las cartas individuales para el Zoom
         fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
         num_cards = len(extracted_cards)
 
@@ -1080,6 +1135,8 @@ async def on_message(message: discord.Message):
         meta["owner_discord_id"] = owner_info.get("discord_id")
         meta["owner_display_name"] = owner_info.get("display_name")
         meta["owner_mention"] = owner_info.get("mention")
+        if friend_id and not meta.get("game_id"):
+            meta["game_id"] = friend_id
 
         if friend_id:
             await add_vip_id(friend_id, group)
@@ -1097,6 +1154,7 @@ async def on_message(message: discord.Message):
 
         post_url = None
         cache_id = str(message.id)
+        now_ts = int(time.time())
 
         if post_data and post_data.get("thread"):
             post_thread = post_data["thread"]
@@ -1104,17 +1162,22 @@ async def on_message(message: discord.Message):
             vote_key = str(post_thread.id)
             cache_id = vote_key
 
-            # Guardar las cartas en caché asociadas al ID del post para el zoom interactivo
             await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
 
-            info_embed = build_forum_info_embed(meta, pack_label, status="none")
+            info_embed = build_forum_info_embed(
+                meta,
+                pack_label,
+                status="none",
+                group=group,
+                created_at_ts=now_ts,
+            )
 
             vote_data = await load_vote_state(group)
             vote_data[vote_key] = {
-                "created_at": time.time(),
+                "created_at": now_ts,
                 "group": group,
                 "owner_discord_id": owner_info.get("discord_id"),
                 "friend_id": friend_id,
@@ -1142,7 +1205,6 @@ async def on_message(message: discord.Message):
         else:
             await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
 
-        # Enviar imagen en modo Abanico al canal principal con botón de enlace + botones de Zoom
         view = (
             ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
             if post_url
@@ -1151,7 +1213,6 @@ async def on_message(message: discord.Message):
         main_file = discord.File(io.BytesIO(fan_bytes), filename="gp_fan.png")
         sent_main = await message.channel.send(file=main_file, view=view)
 
-        # Borrar el mensaje original del webhook inmediatamente
         try:
             await message.delete()
         except Exception:
