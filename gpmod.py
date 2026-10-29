@@ -861,7 +861,7 @@ def build_forum_info_embed(
 
     embed.add_field(name="👑 Found By", value=f"> {obtainer_mention}", inline=True)
     embed.add_field(name="🏷️ Nickname", value=f"> `{nickname}`", inline=True)
-    embed.add_field(name="🎴 Pack Slot", value=f"> `{pack_label}`", inline=True)
+    embed.add_field(name="🎴 Rarity", value=f"> `{pack_label}`", inline=True)
 
     embed.add_field(
         name="📲 Friend ID (Tap to Copy)",
@@ -948,19 +948,21 @@ class CardZoomButton(discord.ui.Button):
 class ForumLinkView(discord.ui.View):
     def __init__(self, post_url: str, meta: dict, pack_label: str, cache_id: str = "", num_cards: int = 5, status: str = "none"):
         super().__init__(timeout=None)
-        packs = meta.get("packs_count", "?")
-        bot = meta.get("bot_name", "Bot")
-        game_id = meta.get("game_id", "ID")
-        owner = meta.get("owner_display_name") or "unknown"
-        prefix = "✅" if status == "alive" else ("❌" if status == "dead" else "")
-        label = f"{prefix} {owner} | {pack_label} [{packs}P] {bot} [{game_id}]".strip()
+        
+        # Extraer el nombre (ej. wRx-99)
+        bot_name = meta.get("bot_name") or "Unknown"
+        
+        # Asignar el emoji según el estado (vacío si aún no hay votos)
+        prefix = "✅ " if status == "alive" else ("❌ " if status == "dead" else "")
+        
+        # Etiqueta corta final (ej. "✅ wRx-99" o solo "wRx-99")
+        label = f"{prefix}{bot_name}".strip()
 
+        # Agregamos ÚNICAMENTE el botón de enlace al post
         self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url, row=0))
-
-        if cache_id:
-            for i in range(num_cards):
-                self.add_item(CardZoomButton(cache_id, i))
-
+        
+        # (Se eliminó el código que agregaba las lupas aquí, 
+        # así solo aparecerán dentro del post del foro a través de GPVoteView)
 
 # =========================================================
 # SISTEMA DE VOTACIÓN ALIVE / DEAD CON CUSTOM_IDS DINÁMICOS
