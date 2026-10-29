@@ -12,6 +12,7 @@ import aiohttp
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+import base64
 import numpy as np
 import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
@@ -377,29 +378,38 @@ def build_inspected_card_image(cards: List[Image.Image], selected_index: int) ->
     return out_buf.getvalue()
 
 
-def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
-    folder = CARDS_CACHE_DIR / str(cache_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    for i, c in enumerate(cards):
-        c.save(folder / f"card_{i}.png", format="PNG")
+async def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
+    try:
+        b64_cards = []
+        for c in cards:
+            buf = io.BytesIO()
+            # Guardar como JPEG para comprimir el tamaño
+            c.convert("RGB").save(buf, format="JPEG", quality=85)
+            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+            b64_cards.append(b64_str)
+        
+        key = f"gpcache:{cache_id}"
+        # EX 172800 le dice a Upstash que lo borre automáticamente en 48 horas
+        await redis_post_command("SET", key, json.dumps(b64_cards), "EX", 172800)
+    except Exception as e:
+        logger.exception("Error guardando cartas en Upstash: %s", e)
 
-    now = time.time()
-    for sub in CARDS_CACHE_DIR.iterdir():
-        if sub.is_dir() and (now - sub.stat().st_mtime) > (72 * 3600):
-            for f in sub.glob("*"):
-                f.unlink(missing_ok=True)
-            sub.rmdir()
-
-
-def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
-    folder = CARDS_CACHE_DIR / str(cache_id)
-    if not folder.exists():
+async def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
+    try:
+        key = f"gpcache:{cache_id}"
+        result = await redis_post_command("GET", key)
+        if not result:
+            return None
+        
+        b64_cards = json.loads(result)
+        cards = []
+        for b64_str in b64_cards:
+            img_bytes = base64.b64decode(b64_str)
+            cards.append(Image.open(io.BytesIO(img_bytes)).convert("RGBA"))
+        return cards
+    except Exception as e:
+        logger.exception("Error cargando cartas desde Upstash: %s", e)
         return None
-    files = sorted(folder.glob("card_*.png"))
-    if not files:
-        return None
-    return [Image.open(f).convert("RGB") for f in files]
-
 
 def convert_gp_to_fan_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
     cards = detect_and_extract_cards(source_img)
@@ -419,6 +429,20 @@ async def get_http_session() -> aiohttp.ClientSession:
         http_session = aiohttp.ClientSession()
     return http_session
 
+async def redis_post_command(command: str, *args):
+    """Permite enviar datos grandes (como imágenes) a Upstash sin romper la URL."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        raise RuntimeError("Missing UPSTASH config")
+    session = await get_http_session()
+    url = UPSTASH_REDIS_REST_URL
+    payload = [command, *args]
+    async with session.post(url, headers=redis_headers(), json=payload) as resp:
+        text = await resp.text()
+        if resp.status not in (200, 201):
+            logger.error(f"Redis POST failed {resp.status}: {text}")
+            return None
+        data = json.loads(text)
+        return data.get("result")
 
 def redis_headers() -> dict:
     return {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
@@ -919,7 +943,7 @@ class CardZoomButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        cards = load_cards_from_cache(self.cache_id)
+        cards = await load_cards_from_cache(self.cache_id)
         if not cards or self.card_index >= len(cards):
             return await interaction.followup.send(
                 "❌ Card inspection cache expired for this pack.",
@@ -1216,7 +1240,7 @@ async def on_message(message: discord.Message):
             vote_key = str(post_thread.id)
             cache_id = vote_key
 
-            await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
+            await save_cards_to_cache(cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
@@ -1257,7 +1281,7 @@ async def on_message(message: discord.Message):
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         else:
-            await asyncio.to_thread(save_cards_to_cache, cache_id, extracted_cards)
+            await save_cards_to_cache(cache_id, extracted_cards)
 
         view = (
             ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
