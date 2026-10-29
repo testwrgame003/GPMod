@@ -820,45 +820,67 @@ def build_forum_info_embed(
     status: str = "none",
     alive_users: Optional[List[str]] = None,
     dead_users: Optional[List[str]] = None,
+    group: str = "Elite_Four",
+    created_at_ts: Optional[int] = None,
 ) -> discord.Embed:
     alive_users = alive_users or []
     dead_users = dead_users or []
+    ts = created_at_ts or int(time.time())
 
     if status == "alive":
         color = 0x2ECC71
-        status_text = "🟢 VERIFIED ALIVE"
+        status_badge = "✅ VERIFIED ALIVE"
+        progress_bar = "🟩🟩🟩🟩🟩🟩🟩🟩"
     elif status == "dead":
         color = 0xE74C3C
-        status_text = "💀 CONFIRMED DEAD"
+        status_badge = "💀 CONFIRMED DEAD"
+        progress_bar = "🟥🟥🟥🟥🟥🟥🟥🟥"
     else:
         color = 0xF1C40F
-        status_text = "⏳ PENDING VERIFICATION"
+        dead_progress = min(len(dead_users), 4)
+        progress_bar = ("🟧" * (dead_progress * 2)) + ("⬛" * (8 - dead_progress * 2)) if dead_progress else "🟨🟨⬛⬛⬛⬛⬛⬛"
+        status_badge = f"⏳ WAITING FOR TEST ({len(dead_users)}/4 Dead)"
 
     obtainer_mention = meta.get("owner_mention") or meta.get("owner_display_name") or "Unknown"
     nickname = meta.get("bot_name") or "Unknown"
     game_id = meta.get("game_id") or "UnknownID"
+    packs_count = meta.get("packs_count")
+    packs_text = f"{packs_count} Packs" if packs_count is not None else "? Packs"
+    pack_name = meta.get("pack_name") or "DeluxeB"
+    filename = meta.get("filename") or "unknown_file.xml"
+    group_label = GROUP_CONFIG.get(group, {}).get("LABEL", group.replace("_", " "))
 
-    # Título y descripción compactos
     embed = discord.Embed(
-        title=f"✨ GOD PACK {pack_label}",
-        description=f"**Status:** {status_text}\n👤 {obtainer_mention}  •  🤖 `{nickname}`",
+        title=f"✨ {group_label.upper()} — GOD PACK {pack_label}",
+        description=(
+            f"> 📦 **Expansion:** `{pack_name}`  •  🎯 **Pulls:** `{packs_text}`  •  🕒 **Found:** <t:{ts}:R>\n"
+            f"> {progress_bar}  **{status_badge}**"
+        ),
         color=color,
     )
 
-    # Bloque de 1 toque para copiar el ID
+    embed.add_field(name="👑 Found By", value=f"> {obtainer_mention}", inline=True)
+    embed.add_field(name="🏷️ Nickname", value=f"> `{nickname}`", inline=True)
+    embed.add_field(name="🎴 Pack Slot", value=f"> `{pack_label}`", inline=True)
+
     embed.add_field(
         name="📲 Friend ID (Tap to Copy)",
         value=f"```\n{game_id}\n```",
         inline=False,
     )
 
-    # Votos minimalistas en una sola línea
+    alive_str = ", ".join(f"<@{u}>" for u in alive_users) if alive_users else "*No votes yet*"
+    dead_str = ", ".join(f"<@{u}>" for u in dead_users) if dead_users else "*No votes yet*"
     embed.add_field(
-        name="🗳️ Votes",
-        value=f"🟢 **{len(alive_users)}** Alive  |  🔴 **{len(dead_users)}** Dead",
+        name="🗳️ Live Community Verification",
+        value=(
+            f"🟢 **Alive ({len(alive_users)}/1):** {alive_str}\n"
+            f"🔴 **Dead ({len(dead_users)}/4):** {dead_str}"
+        ),
         inline=False,
     )
 
+    embed.set_footer(text=f"🔍 Click buttons 1-5 below to inspect each card in HD  •  📄 {filename}")
     return embed
 
 
