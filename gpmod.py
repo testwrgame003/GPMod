@@ -1184,6 +1184,7 @@ async def on_message(message: discord.Message):
             await forward_invalid_message(message, "El mensaje coincide con el formato de GP, pero no contiene una imagen válida adjunta.")
             return
 
+
         first_att = image_attachments[0]
         raw_bytes = await first_att.read()
         source_img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
@@ -1194,8 +1195,18 @@ async def on_message(message: discord.Message):
 
         group = CHANNEL_GROUP_MAP[message.channel.id]
 
-        fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
-        num_cards = len(extracted_cards)
+        # Verificar si la imagen tiene la resolución 240x227 (bot viejo en baja definición)
+        is_low_res = (source_img.size == (240, 227)) or (first_att.width == 240 and first_att.height == 227)
+
+        if is_low_res:
+            fan_bytes = raw_bytes
+            extracted_cards = []
+            num_cards = 0
+            out_filename = first_att.filename or "gp_original.png"
+        else:
+            fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
+            num_cards = len(extracted_cards)
+            out_filename = "gp_fan.png"
 
         meta = parse_heartbeat_metadata(message.content or "")
         pack_label = build_pack_label_from_meta(meta)
@@ -1227,7 +1238,7 @@ async def on_message(message: discord.Message):
             group,
             post_title,
             fan_bytes,
-            filename="gp_fan.png",
+            filename=out_filename,
         )
 
         post_url = None
@@ -1240,7 +1251,8 @@ async def on_message(message: discord.Message):
             vote_key = str(post_thread.id)
             cache_id = vote_key
 
-            await save_cards_to_cache(cache_id, extracted_cards)
+            if extracted_cards:
+                await save_cards_to_cache(cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
@@ -1281,14 +1293,15 @@ async def on_message(message: discord.Message):
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         else:
-            await save_cards_to_cache(cache_id, extracted_cards)
+            if extracted_cards:
+                await save_cards_to_cache(cache_id, extracted_cards)
 
         view = (
             ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
             if post_url
             else None
         )
-        main_file = discord.File(io.BytesIO(fan_bytes), filename="gp_fan.png")
+        main_file = discord.File(io.BytesIO(fan_bytes), filename=out_filename)
         sent_main = await message.channel.send(file=main_file, view=view)
 
         # Enviar respaldo al canal de logs (GP Register)
