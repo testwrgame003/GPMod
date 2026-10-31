@@ -16,7 +16,6 @@ import numpy as np
 import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -29,12 +28,11 @@ except ImportError:
 # Elige fácilmente cómo quieres presentar los God Packs:
 # "TROPHY_GRID"    -> Modo Imagen 1: 3 cartas arriba y 2 abajo con inclinación sutil y luz neón adaptativa
 # "STAGGERED_WAVE" -> Modo Imagen 2: 5 cartas en fila escalonada (ola/podio) 100% rectas con luz adaptativa
-PRESENTATION_MODE = "TROPHY_GRID"
+PRESENTATION_MODE = "STAGGERED_WAVE"
 
 # False -> Fondo oscuro elegante estilo vitrina donde resalta al máximo la luz de color de cada carta (Recomendado)
 # True  -> Fondo 100% transparente (PNG RGBA) manteniendo el resplandor de color alrededor de cada carta
-TRANSPARENT_BACKGROUND = False
-
+TRANSPARENT_BACKGROUND = True
 # =========================================================
 # VARIABLES DE ENTORNO DESDE RAILWAY / .ENV
 # =========================================================
@@ -252,13 +250,13 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 
 def extract_vibrant_card_color(card_img: Image.Image) -> Tuple[int, int, int]:
     """
-    Analiza la carta para extraer su color elemental/dominante más vibrante
-    y saturado para generar el aura de luz adaptativa.
+    Analiza el interior de la ilustración (ignorando el marco plateado/ex) y fuerza
+    una saturación alta en HSV para obtener siempre un color neón puro y vibrante.
     """
-    small = card_img.convert("RGB").resize((48, 64), Image.Resampling.BILINEAR)
-    # Recortamos ligeramente los bordes exteriores para enfocarnos en el marco e ilustración
-    cropped = small.crop((4, 4, 44, 60))
-    arr = np.array(cropped, dtype=np.float32) / 255.0
+    small = card_img.convert("RGB").resize((64, 88), Image.Resampling.BILINEAR)
+    # Recortamos bastante el borde para ignorar los marcos grises/plateados de las cartas 2-stars
+    art_box = small.crop((10, 12, 54, 58))
+    arr = np.array(art_box, dtype=np.float32) / 255.0
     pixels = arr.reshape(-1, 3)
 
     max_c = pixels.max(axis=1)
@@ -268,49 +266,56 @@ def extract_vibrant_card_color(card_img: Image.Image) -> Tuple[int, int, int]:
     sat = np.where(max_c > 0, diff / max_c, 0)
     val = max_c
 
-    # Filtramos grises, blancos puros y negros oscuros para quedarnos con el color vivo
-    mask = (sat > 0.28) & (val > 0.25) & (val < 0.96)
+    # Filtramos grises, blancos de brillo y sombras negras
+    mask = (sat > 0.35) & (val > 0.25) & (val < 0.95)
     vibrant = pixels[mask]
 
-    if len(vibrant) < 15:
-        mask2 = (val > 0.20) & (val < 0.95)
+    if len(vibrant) < 12:
+        mask2 = (sat > 0.18) & (val > 0.20)
         vibrant = pixels[mask2] if np.any(mask2) else pixels
 
-    # Ponderamos los píxeles más saturados y luminosos
     v_max = vibrant.max(axis=1)
     v_min = vibrant.min(axis=1)
     v_sat = np.where(v_max > 0, (v_max - v_min) / v_max, 0)
-    weights = (v_sat ** 1.5) * v_max + 1e-4
+    # Peso agresivo a la saturación para elegir el tono más vivo del arte
+    weights = (v_sat ** 2.8) * (v_max ** 1.2) + 1e-5
 
     avg_rgb = np.average(vibrant, axis=0, weights=weights)
+    r, g, b = avg_rgb[0], avg_rgb[1], avg_rgb[2]
 
-    # Potenciamos el brillo y saturación del color final para que el efecto neón destaque
-    c_max = float(avg_rgb.max())
-    if c_max > 0:
-        avg_rgb = avg_rgb / c_max
+    # Empujar el color resultante hacia saturación neón (mínimo 85% de saturación y 100% brillo)
+    c_max = max(r, g, b)
+    c_min = min(r, g, b)
+    if c_max > c_min:
+        # Normalizar entre 0 y 1 y expandir el rango cromático
+        r_n = (r - c_min) / (c_max - c_min)
+        g_n = (g - c_min) / (c_max - c_min)
+        b_n = (b - c_min) / (c_max - c_min)
+        # Mezclar con un 12% de blanco para el núcleo luminoso sin perder el color puro
+        r_final = int(np.clip((r_n * 0.88 + 0.12) * 255.0, 30, 255))
+        g_final = int(np.clip((g_n * 0.88 + 0.12) * 255.0, 30, 255))
+        b_final = int(np.clip((b_n * 0.88 + 0.12) * 255.0, 30, 255))
+        return (r_final, g_final, b_final)
 
-    r, g, b = [int(np.clip(c * 255.0, 45, 255)) for c in avg_rgb]
-    return (r, g, b)
+    return (160, 90, 255)  # Fallback púrpura neón si una carta fuera 100% monocromática
 
 
 def create_showcase_canvas(width: int, height: int, transparent: bool = False) -> Image.Image:
     if transparent:
         return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
-    bg = Image.new("RGBA", (width, height), (*BG_DARK_COLOR, 255))
-    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(glow)
+    # Mesa oscura mate con viñeteado suave como en el render 3D
+    y_idx = np.linspace(0, 1, height, dtype=np.float32)[:, None]
+    x_idx = np.linspace(-1, 1, width, dtype=np.float32)[None, :]
+    dist = np.sqrt((x_idx * 0.85) ** 2 + ((y_idx - 0.48) * 1.15) ** 2)
+    spotlight = np.clip(1.0 - dist * 0.85, 0.0, 1.0) ** 1.8
 
-    cx, cy = width // 2, height // 2
-    max_rx, max_ry = int(width * 0.52), int(height * 0.52)
-    for step in range(6, 0, -1):
-        ratio = step / 6.0
-        rx, ry = int(max_rx * ratio), int(max_ry * ratio)
-        alpha = int(42 * (1.0 - ratio + 0.15))
-        draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(*BG_CENTER_GLOW, alpha))
+    r = np.clip(14 + spotlight * 28, 0, 255).astype(np.uint8)
+    g = np.clip(16 + spotlight * 31, 0, 255).astype(np.uint8)
+    b = np.clip(22 + spotlight * 40, 0, 255).astype(np.uint8)
+    a = np.full((height, width), 255, dtype=np.uint8)
 
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=50))
-    return Image.alpha_composite(bg, glow)
+    return Image.fromarray(np.stack([r, g, b, a], axis=-1), mode="RGBA")
 
 
 def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target_h: int, radius: int = 18) -> Image.Image:
@@ -326,6 +331,38 @@ def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target
     return out
 
 
+def find_perspective_coeffs(src_pts: List[Tuple[float, float]], dst_pts: List[Tuple[float, float]]) -> List[float]:
+    matrix = []
+    for (x_src, y_src), (x_dst, y_dst) in zip(src_pts, dst_pts):
+        matrix.append([x_dst, y_dst, 1, 0, 0, 0, -x_src * x_dst, -x_src * y_dst])
+        matrix.append([0, 0, 0, x_dst, y_dst, 1, -y_src * x_dst, -y_src * y_dst])
+    A = np.array(matrix, dtype=np.float64)
+    B = np.array(src_pts, dtype=np.float64).reshape(8)
+    return np.linalg.solve(A, B).tolist()
+
+
+def apply_tabletop_3d_tilt(img: Image.Image) -> Image.Image:
+    """
+    Perspectiva 3D pronunciada: estrecha el fondo (arriba), ensancha el frente (abajo)
+    y comprime la altura vertical para que las cartas parezcan acostadas sobre la mesa.
+    """
+    w, h = img.size
+    top_inset = w * 0.145      # Estrechamiento superior fuerte para efecto 3D real
+    bot_outset = w * 0.055     # Expansión frontal hacia la cámara
+    top_drop = h * 0.105       # Acorta la altura aparente (inclinación de mesa)
+    bot_lift = h * 0.025
+
+    src_pts = [(0, 0), (w, 0), (w, h), (0, h)]
+    dst_pts = [
+        (top_inset, top_drop),
+        (w - top_inset, top_drop),
+        (w + bot_outset, h - bot_lift),
+        (-bot_outset, h - bot_lift),
+    ]
+    coeffs = find_perspective_coeffs(src_pts, dst_pts)
+    return img.transform((w, h), Image.Transform.PERSPECTIVE, coeffs, Image.Resampling.BICUBIC)
+
+
 def paste_card_with_adaptive_glow(
     canvas: Image.Image,
     styled_card: Image.Image,
@@ -333,105 +370,114 @@ def paste_card_with_adaptive_glow(
     center_xy: Tuple[int, int],
     glow_color: Tuple[int, int, int],
     radius: int = 18,
-    shadow_offset: Tuple[int, int] = (0, 18),
-    shadow_blur: int = 20,
-    shadow_opacity: int = 190
+    extrude_3d: bool = False,
+    shadow_offset: Tuple[int, int] = (0, 22),
+    shadow_blur: int = 22,
+    shadow_opacity: int = 225
 ) -> None:
-    """
-    Dibuja una sombra profunda, una doble aura de luz neón del color de la carta
-    y un borde luminoso sutil antes de colocar la carta en el lienzo.
-    """
-    pad = 95
+    pad = 110
     w, h = styled_card.size
     total_w, total_h = w + pad * 2, h + pad * 2
 
-    # 1. Capa de Sombra Oscura
+    # Variantes del color para el núcleo brillante y el bisel 3D oscuro
+    core_color = tuple(min(255, int(c * 1.15 + 45)) for c in glow_color)
+    dark_slab = tuple(max(18, int(c * 0.38)) for c in glow_color)
+
+    # 1. Resplandor ambiental amplio sobre la mesa (suave y colorido)
+    ambient_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    ag_draw = ImageDraw.Draw(ambient_glow)
+    sp_amb = 22
+    ag_draw.rounded_rectangle(
+        (pad - sp_amb, pad - sp_amb + 8, pad + w + sp_amb, pad + h + sp_amb + 12),
+        radius=radius + sp_amb,
+        fill=(*glow_color, 150)
+    )
+    ambient_glow = ambient_glow.filter(ImageFilter.GaussianBlur(radius=38))
+
+    # 2. Sombra oscura de contacto justo debajo de la carta
     shadow_layer = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     s_draw = ImageDraw.Draw(shadow_layer)
     s_draw.rounded_rectangle(
-        (pad, pad, pad + w - 1, pad + h - 1),
+        (pad + 2, pad + 6, pad + w - 2, pad + h + 10),
         radius=radius,
         fill=(0, 0, 0, shadow_opacity)
     )
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
 
-    # 2. Capa de Luz Exterior (Aura amplia difuminada del color de la carta)
-    outer_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-    og_draw = ImageDraw.Draw(outer_glow)
-    spread_out = 18
-    og_draw.rounded_rectangle(
-        (pad - spread_out, pad - spread_out, pad + w + spread_out, pad + h + spread_out),
-        radius=radius + spread_out,
-        fill=(*glow_color, 155)
+    # 3. Halo neón intenso pegado al borde (sin cubrir la carta)
+    neon_halo = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    nh_draw = ImageDraw.Draw(neon_halo)
+    sp_neon = 4
+    nh_draw.rounded_rectangle(
+        (pad - sp_neon, pad - sp_neon + 2, pad + w + sp_neon, pad + h + sp_neon + 6),
+        radius=radius + sp_neon,
+        fill=(*core_color, 240)
     )
-    outer_glow = outer_glow.filter(ImageFilter.GaussianBlur(radius=30))
+    neon_halo = neon_halo.filter(ImageFilter.GaussianBlur(radius=9))
 
-    # 3. Capa de Luz Interior (Resplandor intenso pegado al borde de la carta)
-    inner_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-    ig_draw = ImageDraw.Draw(inner_glow)
-    spread_in = 6
-    bright_color = tuple(min(255, int(c * 1.15 + 35)) for c in glow_color)
-    ig_draw.rounded_rectangle(
-        (pad - spread_in, pad - spread_in, pad + w + spread_in, pad + h + spread_in),
-        radius=radius + spread_in,
-        fill=(*bright_color, 215)
-    )
-    inner_glow = inner_glow.filter(ImageFilter.GaussianBlur(radius=11))
-
-    # 4. Combinamos las capas de iluminación y pegamos la carta encima
     combined = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    combined.alpha_composite(ambient_glow, (0, 0))
     combined.alpha_composite(shadow_layer, shadow_offset)
-    combined.alpha_composite(outer_glow, (0, 0))
-    combined.alpha_composite(inner_glow, (0, 0))
-    combined.paste(styled_card, (pad, pad), styled_card)
+    combined.alpha_composite(neon_halo, (0, 0))
 
-    # Pequeño filete de luz en el contorno para darle acabado de vitrina
-    rim_draw = ImageDraw.Draw(combined)
-    rim_draw.rounded_rectangle(
-        (pad - 1, pad - 1, pad + w, pad + h),
-        radius=radius + 1,
-        outline=(*bright_color, 185),
-        width=2
-    )
+    # 4. Bisel físico 3D sutil (canto oscuro con filo luminoso inferior, no bloque plano)
+    if extrude_3d:
+        slab_layer = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+        sl_draw = ImageDraw.Draw(slab_layer)
+        dx_dir = -0.45 if angle > 1 else (0.45 if angle < -1 else 0.0)
+        max_depth = 8
+        for d in range(max_depth, 0, -1):
+            ox = int(round(d * dx_dir))
+            oy = d
+            # La base toca la luz neón, el cuerpo del canto es acrílico oscuro tintado
+            col = core_color if d == max_depth else dark_slab
+            alpha_val = 210 if d == max_depth else 245
+            sl_draw.rounded_rectangle(
+                (pad + ox, pad + oy, pad + w - 1 + ox, pad + h - 1 + oy),
+                radius=radius,
+                fill=(*col, alpha_val)
+            )
+        combined.alpha_composite(slab_layer, (0, 0))
+
+    # 5. Pegar la carta limpia encima (sin marcos de plástico falsos)
+    combined.paste(styled_card, (pad, pad), styled_card)
 
     if abs(angle) > 0.05:
         combined = combined.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
 
     rw, rh = combined.size
     cx, cy = center_xy
-    top_left_x = cx - (rw // 2)
-    top_left_y = cy - (rh // 2)
-
-    canvas.alpha_composite(combined, (top_left_x, top_left_y))
+    canvas.alpha_composite(combined, (cx - rw // 2, cy - rh // 2))
 
 
 def build_trophy_grid_image(cards: List[Image.Image], transparent: bool = False) -> Image.Image:
     """
-    MODO 1 (TROPHY_GRID): 3 cartas arriba y 2 abajo centradas, con ligera inclinación
-    en los extremos y luz adaptativa intensa detrás de cada carta (como en la Imagen 1).
+    MODO 1 (TROPHY_GRID): Distribución espaciada 3 arriba y 2 abajo con inclinación
+    de cámara 3D real hacia atrás y bisel acrílico iluminado.
     """
-    canvas_w, canvas_h = 1520, 1080
-    canvas = create_showcase_canvas(canvas_w, canvas_h, transparent=transparent)
-    num_cards = len(cards)
+    canvas_w, canvas_h = 1680, 1080
+    base_bg = create_showcase_canvas(canvas_w, canvas_h, transparent=transparent)
+    cards_layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
-    card_w, card_h = 336, 468
+    num_cards = len(cards)
+    card_w, card_h = 345, 480
 
     if num_cards == 4:
         positions = [
-            (240, 540, 5.0),
-            (586, 540, 1.5),
-            (934, 540, -1.5),
-            (1280, 540, -5.0),
+            (250, 520, 8.0),
+            (640, 505, 2.5),
+            (1040, 505, -2.5),
+            (1430, 520, -8.0),
         ]
     else:
-        # 3 cartas arriba (izquierda ligeramente inclinada, centro recta, derecha ligeramente inclinada)
-        # 2 cartas abajo centradas en los espacios intermedios
+        # Mayor separación vertical entre la fila superior (y=240) y la inferior (y=805)
+        # para que al inclinar la cámara en 3D no se amontonen en el centro
         positions = [
-            (330, 290, 6.0),    # Arriba Izquierda
-            (760, 280, 0.0),    # Arriba Centro
-            (1190, 290, -6.0),  # Arriba Derecha
-            (535, 790, 3.5),    # Abajo Izquierda
-            (985, 790, -3.5),   # Abajo Derecha
+            (280, 245, 9.5),    # Arriba Izquierda
+            (840, 230, 0.0),    # Arriba Centro
+            (1400, 245, -9.5),  # Arriba Derecha
+            (565, 800, 5.0),    # Abajo Izquierda
+            (1115, 800, -5.0),  # Abajo Derecha
         ]
 
     for idx, card in enumerate(cards):
@@ -441,48 +487,56 @@ def build_trophy_grid_image(cards: List[Image.Image], transparent: bool = False)
         glow_rgb = extract_vibrant_card_color(card)
         styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
         paste_card_with_adaptive_glow(
-            canvas,
+            cards_layer,
             styled,
             angle=angle,
             center_xy=(cx, cy),
             glow_color=glow_rgb,
-            radius=18
+            radius=18,
+            extrude_3d=True,
+            shadow_offset=(0, 24),
+            shadow_blur=22
         )
 
-    return canvas if transparent else canvas.convert("RGB")
+    # Transformación proyectiva 3D sobre toda la mesa de cartas
+    tilted_cards = apply_tabletop_3d_tilt(cards_layer)
+    final_canvas = Image.alpha_composite(base_bg, tilted_cards)
+    return final_canvas if transparent else final_canvas.convert("RGB")
 
 
 def build_staggered_wave_image(cards: List[Image.Image], transparent: bool = False) -> Image.Image:
     """
-    MODO 2 (STAGGERED_WAVE): 5 cartas en una sola fila escalonada tipo ola/podio,
-    100% verticales (0° de rotación), sin solaparse y con luz adaptativa (como en la Imagen 2).
+    MODO 2 (STAGGERED_WAVE): 5 cartas grandes y muy juntas (solo 8px de espacio),
+    escalonadas como en la segunda imagen de referencia.
     """
-    canvas_w, canvas_h = 1920, 860
+    canvas_w, canvas_h = 1920, 940
     canvas = create_showcase_canvas(canvas_w, canvas_h, transparent=transparent)
     num_cards = len(cards)
 
     if num_cards == 4:
-        card_w, card_h = 350, 488
-        positions = [
-            (300, 465, 0.0),
-            (673, 395, 0.0),
-            (1247, 395, 0.0),
-            (1620, 465, 0.0),
-        ]
+        card_w, card_h = 380, 530
+        step_x = card_w + 10
+        start_x = (canvas_w - (step_x * 3)) // 2
+        y_vals = [515, 435, 435, 515]
+        positions = [(start_x + i * step_x, y_vals[i], 0.0) for i in range(4)]
     else:
-        card_w, card_h = 332, 463
-        # Escalonado simétrico: extremos bajos, intermedios a media altura, centro en la cima
+        card_w, card_h = 360, 502
+        step_x = card_w + 8  # Bordes a solo 8px para que los brillos se fundan entre sí
+        center_x = canvas_w // 2
         positions = [
-            (228, 485, 0.0),   # Carta 1 (Baja)
-            (594, 425, 0.0),   # Carta 2 (Media)
-            (960, 365, 0.0),   # Carta 3 (Centro Alta)
-            (1326, 425, 0.0),  # Carta 4 (Media)
-            (1692, 485, 0.0),  # Carta 5 (Baja)
+            (center_x - step_x * 2, 545, 0.0),
+            (center_x - step_x,     470, 0.0),
+            (center_x,              395, 0.0),
+            (center_x + step_x,     470, 0.0),
+            (center_x + step_x * 2, 545, 0.0),
         ]
 
-    for idx, card in enumerate(cards):
-        if idx >= len(positions):
-            break
+    draw_order = [0, 4, 1, 3, 2] if num_cards == 5 else [0, 3, 1, 2]
+
+    for idx in draw_order:
+        if idx >= len(cards) or idx >= len(positions):
+            continue
+        card = cards[idx]
         cx, cy, angle = positions[idx]
         glow_rgb = extract_vibrant_card_color(card)
         styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
@@ -492,7 +546,10 @@ def build_staggered_wave_image(cards: List[Image.Image], transparent: bool = Fal
             angle=angle,
             center_xy=(cx, cy),
             glow_color=glow_rgb,
-            radius=18
+            radius=18,
+            extrude_3d=False,
+            shadow_offset=(0, 20),
+            shadow_blur=20
         )
 
     return canvas if transparent else canvas.convert("RGB")
