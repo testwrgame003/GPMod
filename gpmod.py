@@ -16,6 +16,7 @@ import numpy as np
 import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
