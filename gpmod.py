@@ -315,17 +315,19 @@ def build_fan_image(cards: List[Image.Image], transparent: Optional[bool] = None
     canvas = create_fan_canvas(FAN_CANVAS_W, FAN_CANVAS_H, transparent=use_transparent)
 
     if num_cards == 4:
-        card_w, card_h = 435, 608
-        angles = [12.0, 4.0, -4.0, -12.0]
-        x_centers = [325, 595, 885, 1155]
-        y_offsets = [38, 0, 0, 38]
-        base_y = 385
+        # Configuración de Arco Abierto para 4 cartas (separadas y sin solaparse)
+        card_w, card_h = 390, 545
+        angles = [6.0, 2.0, -2.0, -6.0]         # Ángulos muy suaves
+        x_centers = [340, 610, 870, 1140]       # Mayor distancia horizontal entre centros
+        y_offsets = [15, 0, 0, 15]              # Altura sutil en V
+        base_y = 390
     else:
-        card_w, card_h = 415, 580
-        angles = [15.0, 7.5, 0.0, -7.5, -15.0]
-        x_centers = [265, 502, 740, 978, 1215]
-        y_offsets = [54, 14, 0, 14, 54]
-        base_y = 378
+        # Configuración de Arco Abierto para 5 cartas (100% visibles, sin taparse)
+        card_w, card_h = 360, 504
+        angles = [8.0, 4.0, 0.0, -4.0, -8.0]    # Curvatura abierta y elegante
+        x_centers = [270, 500, 740, 980, 1210]  # Centros separados para liberar el arte central
+        y_offsets = [20, 8, 0, 8, 20]           # Ligero arco hacia arriba en los extremos
+        base_y = 395
 
     for idx, card in enumerate(cards):
         styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
@@ -982,11 +984,7 @@ class ForumLinkView(discord.ui.View):
         self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url, row=0))
         
         # 2. Lupas en la misma línea (slots 2 al 5 en row=0; si hay 5ta carta pasa a row=1)
-        if cache_id and num_cards > 0:
-            for i in range(num_cards):
-                btn = CardZoomButton(cache_id, i)
-                btn.row = 0 if i < 4 else 1
-                self.add_item(btn)
+  
         
         # (Se eliminó el código que agregaba las lupas aquí, 
         # así solo aparecerán dentro del post del foro a través de GPVoteView)
