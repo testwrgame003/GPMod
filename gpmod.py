@@ -12,21 +12,30 @@ import aiohttp
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-import base64
 import numpy as np
 import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
-# =========================================================
-
-# CONFIGURACIÓN VISUAL DEL ABANICO
-# =========================================================
-# True  -> El abanico se genera con fondo 100% transparente (PNG RGBA)
-# False -> El abanico se genera con el fondo oscuro e iluminación radial
-TRANSPARENT_BACKGROUND = True
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # =========================================================
-# VARIABLES DE ENTORNO DESDE RAILWAY
+# CONFIGURACIÓN DE MODO VISUAL Y FONDO
+# =========================================================
+# Elige fácilmente cómo quieres presentar los God Packs:
+# "TROPHY_GRID"    -> Modo Imagen 1: 3 cartas arriba y 2 abajo con inclinación sutil y luz neón adaptativa
+# "STAGGERED_WAVE" -> Modo Imagen 2: 5 cartas en fila escalonada (ola/podio) 100% rectas con luz adaptativa
+PRESENTATION_MODE = "TROPHY_GRID"
+
+# False -> Fondo oscuro elegante estilo vitrina donde resalta al máximo la luz de color de cada carta (Recomendado)
+# True  -> Fondo 100% transparente (PNG RGBA) manteniendo el resplandor de color alrededor de cada carta
+TRANSPARENT_BACKGROUND = False
+
+# =========================================================
+# VARIABLES DE ENTORNO DESDE RAILWAY / .ENV
 # =========================================================
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
@@ -38,25 +47,21 @@ UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/"
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
 # =========================================================
-# CONFIGURACIÓN GENERAL Y CACHÉ DE CARTAS
+# CONFIGURACIÓN GENERAL
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
-CARDS_CACHE_DIR = OUTPUT_DIR / "cards_cache"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-CARDS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("gp_fan_bot")
+logger = logging.getLogger("gp_showcase_bot")
 
-FAN_CANVAS_W = 1480
-FAN_CANVAS_H = 780
-BG_DARK_COLOR = (13, 15, 32)
-BG_GLOW_COLOR = (34, 42, 88)
+BG_DARK_COLOR = (14, 16, 24)
+BG_CENTER_GLOW = (28, 33, 52)
 
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
@@ -123,7 +128,6 @@ async def forward_invalid_message(message: discord.Message, reason: str):
     cooldown_key = f"{message.channel.id}:{owner_id}" if owner_id else str(message.channel.id)
     now = time.monotonic()
     
-    # Si detecta spam masivo del mismo error, borra silenciosamente
     if now - INVALID_LOG_LAST_SENT.get(cooldown_key, 0) < INVALID_LOG_COOLDOWN:
         try:
             await message.delete()
@@ -242,10 +246,53 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 
 
 # =========================================================
-# MOTOR GRÁFICO: MODO ABANICO (TRANSPARENTE O CON FONDO) + ZOOM
+# MOTOR GRÁFICO: EXTRACCIÓN DE COLOR Y 2 MODOS DE VITRINA
 # =========================================================
 
-def create_fan_canvas(width: int, height: int, transparent: bool = True) -> Image.Image:
+def extract_vibrant_card_color(card_img: Image.Image) -> Tuple[int, int, int]:
+    """
+    Analiza la carta para extraer su color elemental/dominante más vibrante
+    y saturado para generar el aura de luz adaptativa.
+    """
+    small = card_img.convert("RGB").resize((48, 64), Image.Resampling.BILINEAR)
+    # Recortamos ligeramente los bordes exteriores para enfocarnos en el marco e ilustración
+    cropped = small.crop((4, 4, 44, 60))
+    arr = np.array(cropped, dtype=np.float32) / 255.0
+    pixels = arr.reshape(-1, 3)
+
+    max_c = pixels.max(axis=1)
+    min_c = pixels.min(axis=1)
+    diff = max_c - min_c
+
+    sat = np.where(max_c > 0, diff / max_c, 0)
+    val = max_c
+
+    # Filtramos grises, blancos puros y negros oscuros para quedarnos con el color vivo
+    mask = (sat > 0.28) & (val > 0.25) & (val < 0.96)
+    vibrant = pixels[mask]
+
+    if len(vibrant) < 15:
+        mask2 = (val > 0.20) & (val < 0.95)
+        vibrant = pixels[mask2] if np.any(mask2) else pixels
+
+    # Ponderamos los píxeles más saturados y luminosos
+    v_max = vibrant.max(axis=1)
+    v_min = vibrant.min(axis=1)
+    v_sat = np.where(v_max > 0, (v_max - v_min) / v_max, 0)
+    weights = (v_sat ** 1.5) * v_max + 1e-4
+
+    avg_rgb = np.average(vibrant, axis=0, weights=weights)
+
+    # Potenciamos el brillo y saturación del color final para que el efecto neón destaque
+    c_max = float(avg_rgb.max())
+    if c_max > 0:
+        avg_rgb = avg_rgb / c_max
+
+    r, g, b = [int(np.clip(c * 255.0, 45, 255)) for c in avg_rgb]
+    return (r, g, b)
+
+
+def create_showcase_canvas(width: int, height: int, transparent: bool = False) -> Image.Image:
     if transparent:
         return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
@@ -254,14 +301,14 @@ def create_fan_canvas(width: int, height: int, transparent: bool = True) -> Imag
     draw = ImageDraw.Draw(glow)
 
     cx, cy = width // 2, height // 2
-    max_rx, max_ry = int(width * 0.48), int(height * 0.48)
+    max_rx, max_ry = int(width * 0.52), int(height * 0.52)
     for step in range(6, 0, -1):
         ratio = step / 6.0
         rx, ry = int(max_rx * ratio), int(max_ry * ratio)
-        alpha = int(38 * (1.0 - ratio + 0.15))
-        draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(*BG_GLOW_COLOR, alpha))
+        alpha = int(42 * (1.0 - ratio + 0.15))
+        draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(*BG_CENTER_GLOW, alpha))
 
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=45))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=50))
     return Image.alpha_composite(bg, glow)
 
 
@@ -278,147 +325,192 @@ def style_card_with_rounded_corners(card_img: Image.Image, target_w: int, target
     return out
 
 
-def paste_rotated_card_with_shadow(
+def paste_card_with_adaptive_glow(
     canvas: Image.Image,
     styled_card: Image.Image,
     angle: float,
     center_xy: Tuple[int, int],
-    shadow_offset: Tuple[int, int] = (-12, 16),
-    shadow_blur: int = 16,
-    shadow_opacity: int = 175
+    glow_color: Tuple[int, int, int],
+    radius: int = 18,
+    shadow_offset: Tuple[int, int] = (0, 18),
+    shadow_blur: int = 20,
+    shadow_opacity: int = 190
 ) -> None:
-    pad = 45
+    """
+    Dibuja una sombra profunda, una doble aura de luz neón del color de la carta
+    y un borde luminoso sutil antes de colocar la carta en el lienzo.
+    """
+    pad = 95
     w, h = styled_card.size
-    padded_card = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
-    padded_card.paste(styled_card, (pad, pad))
+    total_w, total_h = w + pad * 2, h + pad * 2
 
-    alpha = padded_card.split()[3]
-    shadow_alpha = alpha.point(lambda p: int(p * (shadow_opacity / 255.0)))
-    shadow_img = Image.new("RGBA", padded_card.size, (0, 0, 0, 0))
-    shadow_img.putalpha(shadow_alpha)
+    # 1. Capa de Sombra Oscura
+    shadow_layer = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    s_draw = ImageDraw.Draw(shadow_layer)
+    s_draw.rounded_rectangle(
+        (pad, pad, pad + w - 1, pad + h - 1),
+        radius=radius,
+        fill=(0, 0, 0, shadow_opacity)
+    )
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
 
-    rot_card = padded_card.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
-    rot_shadow = shadow_img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
-    rot_shadow = rot_shadow.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
+    # 2. Capa de Luz Exterior (Aura amplia difuminada del color de la carta)
+    outer_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    og_draw = ImageDraw.Draw(outer_glow)
+    spread_out = 18
+    og_draw.rounded_rectangle(
+        (pad - spread_out, pad - spread_out, pad + w + spread_out, pad + h + spread_out),
+        radius=radius + spread_out,
+        fill=(*glow_color, 155)
+    )
+    outer_glow = outer_glow.filter(ImageFilter.GaussianBlur(radius=30))
 
-    rw, rh = rot_card.size
+    # 3. Capa de Luz Interior (Resplandor intenso pegado al borde de la carta)
+    inner_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    ig_draw = ImageDraw.Draw(inner_glow)
+    spread_in = 6
+    bright_color = tuple(min(255, int(c * 1.15 + 35)) for c in glow_color)
+    ig_draw.rounded_rectangle(
+        (pad - spread_in, pad - spread_in, pad + w + spread_in, pad + h + spread_in),
+        radius=radius + spread_in,
+        fill=(*bright_color, 215)
+    )
+    inner_glow = inner_glow.filter(ImageFilter.GaussianBlur(radius=11))
+
+    # 4. Combinamos las capas de iluminación y pegamos la carta encima
+    combined = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    combined.alpha_composite(shadow_layer, shadow_offset)
+    combined.alpha_composite(outer_glow, (0, 0))
+    combined.alpha_composite(inner_glow, (0, 0))
+    combined.paste(styled_card, (pad, pad), styled_card)
+
+    # Pequeño filete de luz en el contorno para darle acabado de vitrina
+    rim_draw = ImageDraw.Draw(combined)
+    rim_draw.rounded_rectangle(
+        (pad - 1, pad - 1, pad + w, pad + h),
+        radius=radius + 1,
+        outline=(*bright_color, 185),
+        width=2
+    )
+
+    if abs(angle) > 0.05:
+        combined = combined.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+
+    rw, rh = combined.size
     cx, cy = center_xy
     top_left_x = cx - (rw // 2)
     top_left_y = cy - (rh // 2)
 
-    canvas.alpha_composite(rot_shadow, (top_left_x + shadow_offset[0], top_left_y + shadow_offset[1]))
-    canvas.alpha_composite(rot_card, (top_left_x, top_left_y))
+    canvas.alpha_composite(combined, (top_left_x, top_left_y))
 
 
-def build_fan_image(cards: List[Image.Image], transparent: Optional[bool] = None) -> Image.Image:
-    use_transparent = TRANSPARENT_BACKGROUND if transparent is None else transparent
+def build_trophy_grid_image(cards: List[Image.Image], transparent: bool = False) -> Image.Image:
+    """
+    MODO 1 (TROPHY_GRID): 3 cartas arriba y 2 abajo centradas, con ligera inclinación
+    en los extremos y luz adaptativa intensa detrás de cada carta (como en la Imagen 1).
+    """
+    canvas_w, canvas_h = 1520, 1080
+    canvas = create_showcase_canvas(canvas_w, canvas_h, transparent=transparent)
     num_cards = len(cards)
-    canvas = create_fan_canvas(FAN_CANVAS_W, FAN_CANVAS_H, transparent=use_transparent)
+
+    card_w, card_h = 336, 468
 
     if num_cards == 4:
-        # Configuración de Arco Abierto para 4 cartas (separadas y sin solaparse)
-        card_w, card_h = 390, 545
-        angles = [6.0, 2.0, -2.0, -6.0]         # Ángulos muy suaves
-        x_centers = [340, 610, 870, 1140]       # Mayor distancia horizontal entre centros
-        y_offsets = [15, 0, 0, 15]              # Altura sutil en V
-        base_y = 390
+        positions = [
+            (240, 540, 5.0),
+            (586, 540, 1.5),
+            (934, 540, -1.5),
+            (1280, 540, -5.0),
+        ]
     else:
-        # Configuración de Arco Abierto para 5 cartas (100% visibles, sin taparse)
-        card_w, card_h = 360, 504
-        angles = [8.0, 4.0, 0.0, -4.0, -8.0]    # Curvatura abierta y elegante
-        x_centers = [270, 500, 740, 980, 1210]  # Centros separados para liberar el arte central
-        y_offsets = [20, 8, 0, 8, 20]           # Ligero arco hacia arriba en los extremos
-        base_y = 395
+        # 3 cartas arriba (izquierda ligeramente inclinada, centro recta, derecha ligeramente inclinada)
+        # 2 cartas abajo centradas en los espacios intermedios
+        positions = [
+            (330, 290, 6.0),    # Arriba Izquierda
+            (760, 280, 0.0),    # Arriba Centro
+            (1190, 290, -6.0),  # Arriba Derecha
+            (535, 790, 3.5),    # Abajo Izquierda
+            (985, 790, -3.5),   # Abajo Derecha
+        ]
 
     for idx, card in enumerate(cards):
+        if idx >= len(positions):
+            break
+        cx, cy, angle = positions[idx]
+        glow_rgb = extract_vibrant_card_color(card)
         styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
-        angle = angles[idx] if idx < len(angles) else 0.0
-        cx = x_centers[idx] if idx < len(x_centers) else (FAN_CANVAS_W // 2)
-        cy = base_y + (y_offsets[idx] if idx < len(y_offsets) else 0)
-        paste_rotated_card_with_shadow(canvas, styled, angle, (cx, cy))
+        paste_card_with_adaptive_glow(
+            canvas,
+            styled,
+            angle=angle,
+            center_xy=(cx, cy),
+            glow_color=glow_rgb,
+            radius=18
+        )
 
-    return canvas if use_transparent else canvas.convert("RGB")
-
-
-def build_inspected_card_image(cards: List[Image.Image], selected_index: int) -> bytes:
-    fan_base = build_fan_image(cards, transparent=TRANSPARENT_BACKGROUND).convert("RGBA")
-
-    r, g, b, a = fan_base.split()
-    rgb_dark = ImageEnhance.Brightness(Image.merge("RGB", (r, g, b))).enhance(0.35)
-    dr, dg, db = rgb_dark.split()
-    if TRANSPARENT_BACKGROUND:
-        a = a.point(lambda p: int(p * 0.55))
-    dimmed_fan = Image.merge("RGBA", (dr, dg, db, a))
-    blurred_bg = dimmed_fan.filter(ImageFilter.GaussianBlur(radius=10))
-
-    target_h = 710
-    target_w = int(round(target_h * (365.5 / 510.0)))
-    selected_card = cards[selected_index]
-    styled_giant = style_card_with_rounded_corners(selected_card, target_w, target_h, radius=22)
-
-    cx, cy = FAN_CANVAS_W // 2, FAN_CANVAS_H // 2
-    glow_layer = Image.new("RGBA", (FAN_CANVAS_W, FAN_CANVAS_H), (0, 0, 0, 0))
-    g_draw = ImageDraw.Draw(glow_layer)
-    gx1, gy1 = cx - target_w // 2 - 12, cy - target_h // 2 - 12
-    gx2, gy2 = cx + target_w // 2 + 12, cy + target_h // 2 + 12
-    g_draw.rounded_rectangle((gx1, gy1, gx2, gy2), radius=28, fill=(255, 225, 130, 125))
-    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
-
-    blurred_bg = Image.alpha_composite(blurred_bg, glow_layer)
-    paste_rotated_card_with_shadow(
-        blurred_bg,
-        styled_giant,
-        angle=0.0,
-        center_xy=(cx, cy),
-        shadow_offset=(0, 20),
-        shadow_blur=24,
-        shadow_opacity=220
-    )
-
-    out_buf = io.BytesIO()
-    final_zoom = blurred_bg if TRANSPARENT_BACKGROUND else blurred_bg.convert("RGB")
-    final_zoom.save(out_buf, format="PNG", optimize=True)
-    return out_buf.getvalue()
+    return canvas if transparent else canvas.convert("RGB")
 
 
-async def save_cards_to_cache(cache_id: str, cards: List[Image.Image]) -> None:
-    try:
-        b64_cards = []
-        for c in cards:
-            buf = io.BytesIO()
-            # Guardar como JPEG para comprimir el tamaño
-            c.convert("RGB").save(buf, format="JPEG", quality=85)
-            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-            b64_cards.append(b64_str)
-        
-        key = f"gpcache:{cache_id}"
-        # EX 172800 le dice a Upstash que lo borre automáticamente en 48 horas
-        await redis_post_command("SET", key, json.dumps(b64_cards), "EX", 172800)
-    except Exception as e:
-        logger.exception("Error guardando cartas en Upstash: %s", e)
+def build_staggered_wave_image(cards: List[Image.Image], transparent: bool = False) -> Image.Image:
+    """
+    MODO 2 (STAGGERED_WAVE): 5 cartas en una sola fila escalonada tipo ola/podio,
+    100% verticales (0° de rotación), sin solaparse y con luz adaptativa (como en la Imagen 2).
+    """
+    canvas_w, canvas_h = 1920, 860
+    canvas = create_showcase_canvas(canvas_w, canvas_h, transparent=transparent)
+    num_cards = len(cards)
 
-async def load_cards_from_cache(cache_id: str) -> Optional[List[Image.Image]]:
-    try:
-        key = f"gpcache:{cache_id}"
-        result = await redis_post_command("GET", key)
-        if not result:
-            return None
-        
-        b64_cards = json.loads(result)
-        cards = []
-        for b64_str in b64_cards:
-            img_bytes = base64.b64decode(b64_str)
-            cards.append(Image.open(io.BytesIO(img_bytes)).convert("RGBA"))
-        return cards
-    except Exception as e:
-        logger.exception("Error cargando cartas desde Upstash: %s", e)
-        return None
+    if num_cards == 4:
+        card_w, card_h = 350, 488
+        positions = [
+            (300, 465, 0.0),
+            (673, 395, 0.0),
+            (1247, 395, 0.0),
+            (1620, 465, 0.0),
+        ]
+    else:
+        card_w, card_h = 332, 463
+        # Escalonado simétrico: extremos bajos, intermedios a media altura, centro en la cima
+        positions = [
+            (228, 485, 0.0),   # Carta 1 (Baja)
+            (594, 425, 0.0),   # Carta 2 (Media)
+            (960, 365, 0.0),   # Carta 3 (Centro Alta)
+            (1326, 425, 0.0),  # Carta 4 (Media)
+            (1692, 485, 0.0),  # Carta 5 (Baja)
+        ]
 
-def convert_gp_to_fan_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
+    for idx, card in enumerate(cards):
+        if idx >= len(positions):
+            break
+        cx, cy, angle = positions[idx]
+        glow_rgb = extract_vibrant_card_color(card)
+        styled = style_card_with_rounded_corners(card, card_w, card_h, radius=18)
+        paste_card_with_adaptive_glow(
+            canvas,
+            styled,
+            angle=angle,
+            center_xy=(cx, cy),
+            glow_color=glow_rgb,
+            radius=18
+        )
+
+    return canvas if transparent else canvas.convert("RGB")
+
+
+def build_gp_showcase_image(cards: List[Image.Image], transparent: Optional[bool] = None) -> Image.Image:
+    use_transparent = TRANSPARENT_BACKGROUND if transparent is None else transparent
+    mode = PRESENTATION_MODE.strip().upper()
+
+    if mode == "STAGGERED_WAVE":
+        return build_staggered_wave_image(cards, transparent=use_transparent)
+    return build_trophy_grid_image(cards, transparent=use_transparent)
+
+
+def convert_gp_to_showcase_bytes(source_img: Image.Image) -> Tuple[bytes, List[Image.Image]]:
     cards = detect_and_extract_cards(source_img)
-    fan_img = build_fan_image(cards, transparent=TRANSPARENT_BACKGROUND)
+    final_img = build_gp_showcase_image(cards, transparent=TRANSPARENT_BACKGROUND)
     out_buf = io.BytesIO()
-    fan_img.save(out_buf, format="PNG", optimize=True)
+    final_img.save(out_buf, format="PNG", optimize=True)
     return out_buf.getvalue(), cards
 
 
@@ -431,21 +523,6 @@ async def get_http_session() -> aiohttp.ClientSession:
     if http_session is None or http_session.closed:
         http_session = aiohttp.ClientSession()
     return http_session
-
-async def redis_post_command(command: str, *args):
-    """Permite enviar datos grandes (como imágenes) a Upstash sin romper la URL."""
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        raise RuntimeError("Missing UPSTASH config")
-    session = await get_http_session()
-    url = UPSTASH_REDIS_REST_URL
-    payload = [command, *args]
-    async with session.post(url, headers=redis_headers(), json=payload) as resp:
-        text = await resp.text()
-        if resp.status not in (200, 201):
-            logger.error(f"Redis POST failed {resp.status}: {text}")
-            return None
-        data = json.loads(text)
-        return data.get("result")
 
 def redis_headers() -> dict:
     return {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
@@ -830,7 +907,7 @@ async def increment_gp_callback(stats: dict) -> dict:
 
 
 # =========================================================
-# PANEL EMBED REDISEÑADO Y MINIMALISTA
+# PANEL EMBED REDISEÑADO Y MINIMALISTA (SIN LUPAS)
 # =========================================================
 
 def build_post_title(meta: dict, pack_label: str) -> str:
@@ -907,7 +984,7 @@ def build_forum_info_embed(
         inline=False,
     )
 
-    embed.set_footer(text=f"🔍 Click buttons 1-5 below to inspect each card in HD  •  📄 {filename}")
+    embed.set_footer(text=f"✨ {PRESENTATION_MODE} Showcase Mode  •  📄 {filename}")
     return embed
 
 
@@ -916,7 +993,7 @@ async def create_forum_post_with_image_bytes(
     group: str,
     title: str,
     image_bytes: bytes,
-    filename: str = "gp_fan.png",
+    filename: str = "gp_showcase.png",
 ) -> Optional[dict]:
     try:
         forum_id = GROUP_CONFIG[group]["FORUM_CHANNEL_ID"]
@@ -932,66 +1009,19 @@ async def create_forum_post_with_image_bytes(
         return None
 
 
-class CardZoomButton(discord.ui.Button):
-    def __init__(self, cache_id: str, card_index: int):
-        super().__init__(
-            label=f"{card_index + 1}",
-            emoji="🔍",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"zoom:{cache_id}:{card_index}",
-            row=1,
-        )
-        self.cache_id = cache_id
-        self.card_index = card_index
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        cards = await load_cards_from_cache(self.cache_id)
-        if not cards or self.card_index >= len(cards):
-            return await interaction.followup.send(
-                "❌ Card inspection cache expired for this pack.",
-                ephemeral=True,
-            )
-
-        zoomed_bytes = await asyncio.to_thread(build_inspected_card_image, cards, self.card_index)
-        file = discord.File(io.BytesIO(zoomed_bytes), filename=f"card_{self.card_index + 1}_zoom.png")
-
-        switch_view = discord.ui.View(timeout=180)
-        for idx in range(len(cards)):
-            btn = CardZoomButton(self.cache_id, idx)
-            btn.row = 0
-            if idx == self.card_index:
-                btn.style = discord.ButtonStyle.primary
-            switch_view.add_item(btn)
-
-        await interaction.followup.send(
-            content=f"🔎 **Inspecting Card #{self.card_index + 1} of {len(cards)}**",
-            file=file,
-            view=switch_view,
-            ephemeral=True,
-        )
-
-
 class ForumLinkView(discord.ui.View):
-    def __init__(self, post_url: str, meta: dict, pack_label: str, cache_id: str = "", num_cards: int = 5, status: str = "none"):
+    def __init__(self, post_url: str, meta: dict, pack_label: str, status: str = "none"):
         super().__init__(timeout=None)
-        
-        # Extraer el nombre corto (ej. wRx-99)
         bot_name = meta.get("bot_name") or "Unknown"
         prefix = "✅ " if status == "alive" else ("❌ " if status == "dead" else "")
         label = f"{prefix}{bot_name}".strip()
 
-        # 1. Botón de enlace en la fila 0 (ocupa el slot 1 de 5)
+        # Botón limpio de enlace directo al post (sin lupas)
         self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url, row=0))
-        
-        # 2. Lupas en la misma línea (slots 2 al 5 en row=0; si hay 5ta carta pasa a row=1)
-  
-        
-        # (Se eliminó el código que agregaba las lupas aquí, 
-        # así solo aparecerán dentro del post del foro a través de GPVoteView)
+
 
 # =========================================================
-# SISTEMA DE VOTACIÓN ALIVE / DEAD CON CUSTOM_IDS DINÁMICOS
+# SISTEMA DE VOTACIÓN ALIVE / DEAD (SIN LUPAS)
 # =========================================================
 
 async def load_vote_state(group: str) -> dict:
@@ -1032,15 +1062,13 @@ async def update_main_link_button(state: dict, status: str, meta: dict, pack_lab
 
         channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
         msg = await channel.fetch_message(int(message_id))
-        cache_id = state.get("cache_id", "")
-        num_cards = int(state.get("num_cards", 5))
-        await msg.edit(view=ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards, status=status))
+        await msg.edit(view=ForumLinkView(post_url, meta, pack_label, status=status))
     except Exception:
         pass
 
 
 class GPVoteView(discord.ui.View):
-    def __init__(self, vote_key: str, group: str, num_cards: int = 5):
+    def __init__(self, vote_key: str, group: str):
         super().__init__(timeout=None)
         self.vote_key = vote_key
         self.group = group
@@ -1062,9 +1090,6 @@ class GPVoteView(discord.ui.View):
         )
         self.btn_dead.callback = self.dead_callback
         self.add_item(self.btn_dead)
-
-        for i in range(num_cards):
-            self.add_item(CardZoomButton(vote_key, i))
 
     async def alive_callback(self, interaction: discord.Interaction):
         await self.handle_vote(interaction, "alive")
@@ -1140,8 +1165,7 @@ async def restore_persistent_views():
         try:
             vote_data = await load_vote_state(group)
             for vote_key, state in vote_data.items():
-                num_c = int(state.get("num_cards", 5))
-                view = GPVoteView(vote_key=str(vote_key), group=group, num_cards=num_c)
+                view = GPVoteView(vote_key=str(vote_key), group=group)
                 alive_count = len(state.get("alive_users", []))
                 dead_count = len(state.get("dead_users", []))
                 
@@ -1161,7 +1185,12 @@ async def restore_persistent_views():
 
 @client.event
 async def on_ready():
-    logger.info("✅ Bot GP Abanico (Transparent=%s) conectado como %s", TRANSPARENT_BACKGROUND, client.user)
+    logger.info(
+        "✅ Bot GP Showcase (Mode=%s, Transparent=%s) conectado como %s",
+        PRESENTATION_MODE,
+        TRANSPARENT_BACKGROUND,
+        client.user,
+    )
     await restore_persistent_views()
 
 
@@ -1186,7 +1215,6 @@ async def on_message(message: discord.Message):
             await forward_invalid_message(message, "El mensaje coincide con el formato de GP, pero no contiene una imagen válida adjunta.")
             return
 
-
         first_att = image_attachments[0]
         raw_bytes = await first_att.read()
         source_img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
@@ -1197,18 +1225,15 @@ async def on_message(message: discord.Message):
 
         group = CHANNEL_GROUP_MAP[message.channel.id]
 
-        # Verificar si la imagen tiene la resolución 240x227 (bot viejo en baja definición)
+        # Si el adjunto viene del bot viejo en baja resolución (240x227), se publica directo sin recorte
         is_low_res = (source_img.size == (240, 227)) or (first_att.width == 240 and first_att.height == 227)
 
         if is_low_res:
-            fan_bytes = raw_bytes
-            extracted_cards = []
-            num_cards = 0
+            showcase_bytes = raw_bytes
             out_filename = first_att.filename or "gp_original.png"
         else:
-            fan_bytes, extracted_cards = await asyncio.to_thread(convert_gp_to_fan_bytes, source_img)
-            num_cards = len(extracted_cards)
-            out_filename = "gp_fan.png"
+            showcase_bytes, _ = await asyncio.to_thread(convert_gp_to_showcase_bytes, source_img)
+            out_filename = "gp_showcase.png"
 
         meta = parse_heartbeat_metadata(message.content or "")
         pack_label = build_pack_label_from_meta(meta)
@@ -1239,22 +1264,17 @@ async def on_message(message: discord.Message):
             client,
             group,
             post_title,
-            fan_bytes,
+            showcase_bytes,
             filename=out_filename,
         )
 
         post_url = None
-        cache_id = str(message.id)
         now_ts = int(time.time())
 
         if post_data and post_data.get("thread"):
             post_thread = post_data["thread"]
             post_url = post_data["jump_url"]
             vote_key = str(post_thread.id)
-            cache_id = vote_key
-
-            if extracted_cards:
-                await save_cards_to_cache(cache_id, extracted_cards)
 
             online_mentions = await get_online_mentions(group)
             mentions_text = " ".join(online_mentions) if online_mentions else "No active users"
@@ -1282,28 +1302,19 @@ async def on_message(message: discord.Message):
                 "post_url": post_url,
                 "meta": meta,
                 "pack_label": pack_label,
-                "cache_id": cache_id,
-                "num_cards": num_cards,
             }
             await save_vote_state(group, vote_data)
 
-            vote_view = GPVoteView(vote_key=vote_key, group=group, num_cards=num_cards)
+            vote_view = GPVoteView(vote_key=vote_key, group=group)
             await post_thread.send(
                 content=mentions_text,
                 embed=info_embed,
                 view=vote_view,
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
-        else:
-            if extracted_cards:
-                await save_cards_to_cache(cache_id, extracted_cards)
 
-        view = (
-            ForumLinkView(post_url, meta, pack_label, cache_id=cache_id, num_cards=num_cards)
-            if post_url
-            else None
-        )
-        main_file = discord.File(io.BytesIO(fan_bytes), filename=out_filename)
+        view = ForumLinkView(post_url, meta, pack_label) if post_url else None
+        main_file = discord.File(io.BytesIO(showcase_bytes), filename=out_filename)
         sent_main = await message.channel.send(file=main_file, view=view)
 
         # Enviar respaldo al canal de logs (GP Register)
