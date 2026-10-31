@@ -973,17 +973,20 @@ class ForumLinkView(discord.ui.View):
     def __init__(self, post_url: str, meta: dict, pack_label: str, cache_id: str = "", num_cards: int = 5, status: str = "none"):
         super().__init__(timeout=None)
         
-        # Extraer el nombre (ej. wRx-99)
+        # Extraer el nombre corto (ej. wRx-99)
         bot_name = meta.get("bot_name") or "Unknown"
-        
-        # Asignar el emoji según el estado (vacío si aún no hay votos)
         prefix = "✅ " if status == "alive" else ("❌ " if status == "dead" else "")
-        
-        # Etiqueta corta final (ej. "✅ wRx-99" o solo "wRx-99")
         label = f"{prefix}{bot_name}".strip()
 
-        # Agregamos ÚNICAMENTE el botón de enlace al post
+        # 1. Botón de enlace en la fila 0 (ocupa el slot 1 de 5)
         self.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=post_url, row=0))
+        
+        # 2. Lupas en la misma línea (slots 2 al 5 en row=0; si hay 5ta carta pasa a row=1)
+        if cache_id and num_cards > 0:
+            for i in range(num_cards):
+                btn = CardZoomButton(cache_id, i)
+                btn.row = 0 if i < 4 else 1
+                self.add_item(btn)
         
         # (Se eliminó el código que agregaba las lupas aquí, 
         # así solo aparecerán dentro del post del foro a través de GPVoteView)
