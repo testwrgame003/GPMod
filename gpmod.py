@@ -248,15 +248,6 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 # MOTOR GRÁFICO: STAGGERED WAVE MEJORADO (BORDE FINO)
 # =========================================================
 
-def trim_excess_dark_border(card_img: Image.Image, trim_ratio: float = 0.018) -> Image.Image:
-    """
-    Recorta el excedente de margen negro del emulador alrededor de la carta
-    para dejar únicamente un borde oscuro fino, limpio y uniforme.
-    """
-    w, h = card_img.size
-    dx = max(1, int(round(w * trim_ratio)))
-    dy = max(1, int(round(h * trim_ratio)))
-    return card_img.crop((dx, dy, w - dx, h - dy))
 
 
 def extract_vibrant_card_color(card_img: Image.Image) -> Tuple[int, int, int]:
@@ -322,13 +313,51 @@ def create_showcase_canvas(width: int, height: int, transparent: bool = False) -
     return Image.fromarray(np.stack([r, g, b, a], axis=-1), mode="RGBA")
 
 
+def auto_center_card_art(card_img: Image.Image) -> Image.Image:
+    """
+    Detecta los límites exactos del arte/marco de cada carta individualmente,
+    eliminando las franjas negras asimétricas que quedan a la izquierda o derecha
+    al recortar desde la captura del emulador.
+    """
+    rgb = card_img.convert("RGB")
+    w, h = rgb.size
+    arr = np.array(rgb, dtype=np.float32)
+
+    # Calculamos el brillo máximo por píxel para distinguir el marco de la carta del borde negro
+    brightness = arr.max(axis=2)
+
+    # Analizamos la franja central vertical y horizontal para ignorar las esquinas redondeadas
+    col_profile = np.percentile(brightness[int(h * 0.15):int(h * 0.85), :], 85, axis=0)
+    row_profile = np.percentile(brightness[:, int(w * 0.15):int(w * 0.85)], 85, axis=1)
+
+    # Umbral para detectar dónde empieza realmente el marco impreso de la carta
+    valid_cols = np.where(col_profile > 42.0)[0]
+    valid_rows = np.where(row_profile > 42.0)[0]
+
+    if len(valid_cols) > int(w * 0.70) and len(valid_rows) > int(h * 0.70):
+        x1, x2 = int(valid_cols[0]), int(valid_cols[-1]) + 1
+        y1, y2 = int(valid_rows[0]), int(valid_rows[-1]) + 1
+        # Afeitamos 2px extra hacia adentro para asegurar que no quede rastro del borde viejo
+        pad_in = 2
+        x1 = min(x1 + pad_in, w // 4)
+        y1 = min(y1 + pad_in, h // 4)
+        x2 = max(x2 - pad_in, w - (w // 4))
+        y2 = max(y2 - pad_in, h - (h // 4))
+        return rgb.crop((x1, y1, x2, y2))
+
+    # Fallback uniforme si la carta es extremadamente oscura
+    dx = max(2, int(round(w * 0.022)))
+    dy = max(2, int(round(h * 0.022)))
+    return rgb.crop((dx, dy, w - dx, h - dy))
+
+
 def style_card_with_thin_border(card_img: Image.Image, target_w: int, target_h: int, radius: int = 16) -> Image.Image:
     """
-    Afeita el margen grueso del recorte original, redimensiona con nitidez y añade
-    un borde oscuro delgado de 2px para definir la silueta sin engrosarla.
+    Centra el arte eliminando bordes disparejos, redimensiona con nitidez y dibuja
+    un borde negro uniforme y un poco más grueso (5px) alrededor de toda la carta.
     """
-    trimmed = trim_excess_dark_border(card_img, trim_ratio=0.018)
-    resized = trimmed.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+    centered = auto_center_card_art(card_img)
+    resized = centered.resize((target_w, target_h), Image.Resampling.LANCZOS)
     sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.1, percent=115, threshold=2)).convert("RGBA")
 
     mask = Image.new("L", (target_w, target_h), 0)
@@ -338,16 +367,15 @@ def style_card_with_thin_border(card_img: Image.Image, target_w: int, target_h: 
     out = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
     out.paste(sharpened, (0, 0), mask)
 
-    # Borde negro sutil y delgado (2px) para que el contorno se vea limpio y definido
+    # Borde negro simétrico y un poco más grueso (width=5) en los 4 lados
     border_draw = ImageDraw.Draw(out)
     border_draw.rounded_rectangle(
         (0, 0, target_w - 1, target_h - 1),
         radius=radius,
-        outline=(18, 20, 26, 235),
-        width=2
+        outline=(12, 14, 20, 255),
+        width=5
     )
     return out
-
 
 def paste_card_with_adaptive_glow(
     canvas: Image.Image,
