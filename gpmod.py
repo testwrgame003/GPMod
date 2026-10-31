@@ -18,6 +18,7 @@ import discord
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
 # =========================================================
+
 # CONFIGURACIÓN VISUAL DEL ABANICO
 # =========================================================
 # True  -> El abanico se genera con fondo 100% transparente (PNG RGBA)
