@@ -801,7 +801,7 @@ async def cleanup_expired_vips(group: str):
         if not vip_data:
             return
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        expire_seconds = 48 * 60 * 60
+        expire_seconds = 28 * 60 * 60
         items = vip_data.items() if isinstance(vip_data, dict) else zip(vip_data[0::2], vip_data[1::2])
         for friend_id, saved_ts in items:
             try:
