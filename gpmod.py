@@ -62,6 +62,9 @@ logger = logging.getLogger("gp_showcase_bot")
 BG_DARK_COLOR = (14, 16, 24)
 BG_CENTER_GLOW = (28, 33, 52)
 
+VIP_EXPIRATION_HOURS = 28
+VIP_EXCLUSIVE_GROUPS = ("Elite_Four", "Gym_Leader")
+
 TRIGGER_PATTERNS = [
     re.compile(r"god\s*pack", re.IGNORECASE),
     re.compile(r"\[\d/[45]\]\[\d+P\]\[[^\]]+\]", re.IGNORECASE),
@@ -126,7 +129,7 @@ async def forward_invalid_message(message: discord.Message, reason: str):
 
     cooldown_key = f"{message.channel.id}:{owner_id}" if owner_id else str(message.channel.id)
     now = time.monotonic()
-    
+
     if now - INVALID_LOG_LAST_SENT.get(cooldown_key, 0) < INVALID_LOG_COOLDOWN:
         try:
             await message.delete()
@@ -248,8 +251,6 @@ def detect_and_extract_cards(source_img: Image.Image) -> List[Image.Image]:
 # MOTOR GRÁFICO: STAGGERED WAVE MEJORADO (BORDE FINO)
 # =========================================================
 
-
-
 def extract_vibrant_card_color(card_img: Image.Image) -> Tuple[int, int, int]:
     """
     Analiza la ilustración central y extrae su color más saturado y vivo
@@ -323,21 +324,17 @@ def auto_center_card_art(card_img: Image.Image) -> Image.Image:
     w, h = rgb.size
     arr = np.array(rgb, dtype=np.float32)
 
-    # Calculamos el brillo máximo por píxel para distinguir el marco de la carta del borde negro
     brightness = arr.max(axis=2)
 
-    # Analizamos la franja central vertical y horizontal para ignorar las esquinas redondeadas
     col_profile = np.percentile(brightness[int(h * 0.15):int(h * 0.85), :], 85, axis=0)
     row_profile = np.percentile(brightness[:, int(w * 0.15):int(w * 0.85)], 85, axis=1)
 
-    # Umbral para detectar dónde empieza realmente el marco impreso de la carta
     valid_cols = np.where(col_profile > 42.0)[0]
     valid_rows = np.where(row_profile > 42.0)[0]
 
     if len(valid_cols) > int(w * 0.70) and len(valid_rows) > int(h * 0.70):
         x1, x2 = int(valid_cols[0]), int(valid_cols[-1]) + 1
         y1, y2 = int(valid_rows[0]), int(valid_rows[-1]) + 1
-        # Afeitamos 2px extra hacia adentro para asegurar que no quede rastro del borde viejo
         pad_in = 2
         x1 = min(x1 + pad_in, w // 4)
         y1 = min(y1 + pad_in, h // 4)
@@ -345,7 +342,6 @@ def auto_center_card_art(card_img: Image.Image) -> Image.Image:
         y2 = max(y2 - pad_in, h - (h // 4))
         return rgb.crop((x1, y1, x2, y2))
 
-    # Fallback uniforme si la carta es extremadamente oscura
     dx = max(2, int(round(w * 0.022)))
     dy = max(2, int(round(h * 0.022)))
     return rgb.crop((dx, dy, w - dx, h - dy))
@@ -367,7 +363,6 @@ def style_card_with_thin_border(card_img: Image.Image, target_w: int, target_h: 
     out = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
     out.paste(sharpened, (0, 0), mask)
 
-    # Borde negro simétrico y un poco más grueso (width=5) en los 4 lados
     border_draw = ImageDraw.Draw(out)
     border_draw.rounded_rectangle(
         (0, 0, target_w - 1, target_h - 1),
@@ -390,7 +385,6 @@ def paste_card_with_adaptive_glow(
 
     core_color = tuple(min(255, int(c * 1.15 + 45)) for c in glow_color)
 
-    # 1. Sombra inferior contenida (no sobresale a los lados para no engrosar el borde negro)
     shadow_layer = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     s_draw = ImageDraw.Draw(shadow_layer)
     s_draw.rounded_rectangle(
@@ -400,7 +394,6 @@ def paste_card_with_adaptive_glow(
     )
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=14))
 
-    # 2. Aura difusa de color alrededor de la carta
     ambient_glow = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     ag_draw = ImageDraw.Draw(ambient_glow)
     sp_amb = 18
@@ -411,7 +404,6 @@ def paste_card_with_adaptive_glow(
     )
     ambient_glow = ambient_glow.filter(ImageFilter.GaussianBlur(radius=28))
 
-    # 3. Halo neón pegado directamente al borde delgado de la carta
     neon_halo = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
     nh_draw = ImageDraw.Draw(neon_halo)
     sp_neon = 4
@@ -435,7 +427,6 @@ def paste_card_with_adaptive_glow(
 
 def build_gp_showcase_image(cards: List[Image.Image], transparent: Optional[bool] = None) -> Image.Image:
     use_transparent = TRANSPARENT_BACKGROUND if transparent is None else transparent
-    # Lienzo ajustado con menos espacio vacío arriba y abajo
     canvas_w, canvas_h = 1920, 830
     canvas = create_showcase_canvas(canvas_w, canvas_h, transparent=use_transparent)
     num_cards = len(cards)
@@ -449,14 +440,14 @@ def build_gp_showcase_image(cards: List[Image.Image], transparent: Optional[bool
         draw_order = [0, 3, 1, 2]
     else:
         card_w, card_h = 362, 504
-        step_x = card_w + 12  # Separación limpia para que luzca el halo sin encimarse
+        step_x = card_w + 12
         center_x = canvas_w // 2
         positions = [
-            (center_x - step_x * 2, 480),  # Extremo Izquierdo
-            (center_x - step_x,     415),  # Intermedio Izquierdo
-            (center_x,              350),  # Centro (Podio)
-            (center_x + step_x,     415),  # Intermedio Derecho
-            (center_x + step_x * 2, 480),  # Extremo Derecho
+            (center_x - step_x * 2, 480),
+            (center_x - step_x,     415),
+            (center_x,              350),
+            (center_x + step_x,     415),
+            (center_x + step_x * 2, 480),
         ]
         draw_order = [0, 4, 1, 3, 2]
 
@@ -509,6 +500,10 @@ def online_key(group: str) -> str:
 
 def vip_key(group: str) -> str:
     return f"vip:{group}"
+
+
+def vip_exclusive_key(group: str) -> str:
+    return f"vip_exclusive:{group}"
 
 
 def gp_users_key() -> str:
@@ -660,6 +655,12 @@ def parse_heartbeat_metadata(content: str) -> dict:
         if m:
             result["filename"] = m.group(1).strip()
 
+    if result["pack_position"] is None:
+        m_fallback = re.search(r"\[(\d)/([45])\]", content)
+        if m_fallback:
+            result["pack_position"] = int(m_fallback.group(1))
+            result["pack_total"] = int(m_fallback.group(2))
+
     return result
 
 
@@ -669,6 +670,11 @@ def build_pack_label_from_meta(meta: dict) -> str:
     if isinstance(pos, int) and 1 <= pos <= 5:
         return f"[{pos}/{total}]"
     return f"[?/{total}]"
+
+
+def is_vip_exclusive_gp(meta: dict) -> bool:
+    """Devuelve True únicamente si la rareza del God Pack es 4/5 o 5/5."""
+    return meta.get("pack_position") in (4, 5) and meta.get("pack_total") == 5
 
 
 async def load_group_users(group: str) -> dict:
@@ -778,7 +784,7 @@ async def resolve_gp_owner(client: discord.Client, content: str, group: str) -> 
 
 
 # =========================================================
-# GESTIÓN DE VIPS, STATS Y MENCIONES ONLINE
+# GESTIÓN DE VIPS (NORMAL Y EXCLUSIVE), STATS Y MENCIONES
 # =========================================================
 
 async def add_vip_id(friend_id: str, group: str) -> bool:
@@ -794,24 +800,46 @@ async def add_vip_id(friend_id: str, group: str) -> bool:
         return False
 
 
-async def cleanup_expired_vips(group: str):
+async def add_vip_exclusive_id(friend_id: str, group: str) -> bool:
+    friend_id = str(friend_id or "").strip()
+    if not re.fullmatch(r"\d{16}", friend_id) or group not in VIP_EXCLUSIVE_GROUPS:
+        return False
     try:
-        ts_key = f"{vip_key(group)}:timestamps"
+        key = vip_exclusive_key(group)
+        await redis_sadd_id(key, friend_id)
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        await redis_command("hset", f"{key}:timestamps", friend_id, now_ts)
+        logger.info("🌟 VIP Exclusive agregado en %s: %s", group, friend_id)
+        return True
+    except Exception as e:
+        logger.exception("Error agregando VIP Exclusive en %s: %s", group, e)
+        return False
+
+
+async def _cleanup_expired_vip_key(base_key: str):
+    try:
+        ts_key = f"{base_key}:timestamps"
         vip_data = await redis_command("hgetall", ts_key)
         if not vip_data:
             return
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        expire_seconds = 28 * 60 * 60
+        expire_seconds = VIP_EXPIRATION_HOURS * 60 * 60
         items = vip_data.items() if isinstance(vip_data, dict) else zip(vip_data[0::2], vip_data[1::2])
         for friend_id, saved_ts in items:
             try:
                 if (now_ts - int(saved_ts)) >= expire_seconds:
-                    await redis_command("srem", vip_key(group), friend_id)
+                    await redis_command("srem", base_key, friend_id)
                     await redis_command("hdel", ts_key, friend_id)
             except Exception:
                 pass
     except Exception:
         pass
+
+
+async def cleanup_expired_vips(group: str):
+    await _cleanup_expired_vip_key(vip_key(group))
+    if group in VIP_EXCLUSIVE_GROUPS:
+        await _cleanup_expired_vip_key(vip_exclusive_key(group))
 
 
 async def register_user_gp(owner_info: dict) -> None:
@@ -1045,18 +1073,18 @@ class GPVoteView(discord.ui.View):
         self.group = group
 
         self.btn_alive = discord.ui.Button(
-            label="🟢 Alive (0)", 
-            style=discord.ButtonStyle.success, 
-            custom_id=f"gp_alive_{vote_key}", 
+            label="🟢 Alive (0)",
+            style=discord.ButtonStyle.success,
+            custom_id=f"gp_alive_{vote_key}",
             row=0
         )
         self.btn_alive.callback = self.alive_callback
         self.add_item(self.btn_alive)
 
         self.btn_dead = discord.ui.Button(
-            label="🔴 Dead (0)", 
-            style=discord.ButtonStyle.danger, 
-            custom_id=f"gp_dead_{vote_key}", 
+            label="🔴 Dead (0)",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"gp_dead_{vote_key}",
             row=0
         )
         self.btn_dead.callback = self.dead_callback
@@ -1097,7 +1125,7 @@ class GPVoteView(discord.ui.View):
 
         self.btn_alive.label = f"🟢 Alive ({alive_count})"
         self.btn_dead.label = f"🔴 Dead ({dead_count})"
-        
+
         if status in ("alive", "dead"):
             self.btn_alive.disabled = True
             self.btn_dead.disabled = True
@@ -1139,14 +1167,14 @@ async def restore_persistent_views():
                 view = GPVoteView(vote_key=str(vote_key), group=group)
                 alive_count = len(state.get("alive_users", []))
                 dead_count = len(state.get("dead_users", []))
-                
+
                 view.btn_alive.label = f"🟢 Alive ({alive_count})"
                 view.btn_dead.label = f"🔴 Dead ({dead_count})"
-                
+
                 if state.get("status") in ("alive", "dead"):
                     view.btn_alive.disabled = True
                     view.btn_dead.disabled = True
-                
+
                 client.add_view(view)
                 restored += 1
         except Exception:
@@ -1227,6 +1255,8 @@ async def on_message(message: discord.Message):
 
         if friend_id:
             await add_vip_id(friend_id, group)
+            if group in VIP_EXCLUSIVE_GROUPS and is_vip_exclusive_gp(meta):
+                await add_vip_exclusive_id(friend_id, group)
         await register_user_gp(owner_info)
         await update_stats_safe(group, increment_gp_callback)
 
